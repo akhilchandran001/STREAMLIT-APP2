@@ -1,0 +1,9 @@
+streamlit
+pyrofork
+tgcrypto
+curl_cffi
+websockets
+requests
+numpy
+opencv-python-headless
+bingart
