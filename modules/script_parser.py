@@ -1,6 +1,6 @@
-import asyncio
 import glob
 import json
+import logging
 import os
 import shutil
 import time
@@ -11,191 +11,221 @@ from modules.bing_fetcher import generate_bing_image
 from animations.animation_router import render_animation_by_index
 from modules.ffmpeg_compositor import render_individual_scene, concat_all_scenes
 
-BASE_DIR = os.getcwd()
-BG_DIR = os.path.join(BASE_DIR, "assets", "backgrounds")
-TEMP_DIR = os.path.join(BASE_DIR, "storage", "temp")
-OUTPUT_DIR = os.path.join(BASE_DIR, "storage", "outputs")
+# Configure logger
+logger = logging.getLogger("VideoEngine.Pipeline")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+# Concepts that warrant AI generation over stock photo search
+ABSTRACT_AI_KEYWORDS = {
+    "quantum", "subatomic", "particle", "ghost", "neutrino", "matrix", "cyber",
+    "futuristic", "citadel", "portal", "dimension", "black hole", "singularity",
+    "supernova", "cosmic energy", "abstract", "alien", "energy silhouette"
+}
 
 
-def get_available_backgrounds() -> list[str]:
+def evaluate_image_source_decision(scene: dict) -> str:
+    """
+    Decides whether an image should be AI-generated ('bing') or scraped ('fetch'):
+    1. Explicit override in JSON takes precedence.
+    2. Prompt complexity analysis for abstract/sci-fi concepts.
+    3. Scraped stock photo for real tangible entities.
+    """
+    explicit = scene.get("image_source") or scene.get("source")
+    if explicit and explicit.lower() in ["bing", "ai", "dall-e"]:
+        return "bing"
+    if explicit and explicit.lower() in ["fetch", "wikimedia", "scrape"]:
+        return "fetch"
+
+    prompt_text = scene.get("prompt", "").lower()
+    query_text = scene.get("query", "").lower()
+    combined_text = f"{prompt_text} {query_text}"
+
+    if any(kw in combined_text for kw in ABSTRACT_AI_KEYWORDS):
+        return "bing"
+
+    return "fetch"
+
+
+def get_available_backgrounds(assets_dir: str = "assets/backgrounds") -> list[str]:
     """Finds all looping background MP4s inside assets/backgrounds."""
-    bgs = sorted(glob.glob(os.path.join(BG_DIR, "*.mp4")))
-    if not bgs:
-        # Fallback check directly in root assets
-        bgs = sorted(glob.glob(os.path.join(BASE_DIR, "assets", "*.mp4")))
-    return bgs
+    patterns = [os.path.join(assets_dir, "*.mp4"), os.path.join(assets_dir, "*.MP4")]
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(p))
+    return sorted(files)
 
 
-async def process_video_pipeline(
-    script_data: list[dict] | str,
-    bing_cookie_u: str,
-    voice_name: str = "Shreeraj_HindiProfile",
-    progress_callback=None
+def process_video_pipeline(
+    script_data: list[dict],
+    output_video_path: str,
+    temp_dir: str = "temp_pipeline",
+    bing_cookie: str = "",
+    progress_callback=None,
+    artifact_callback=None
 ) -> str:
     """
-    Parses sentence-by-sentence JSON script and produces the final assembled video.
-
-    JSON Schema expected:
-    [
-        {
-            "sentence": "Malayalam text for TTS",
-            "query": "Pixabay search keywords",
-            "prompt": "Bing image generation prompt (optional)",
-            "source": "bing" or "pixabay" (defaults to "bing" if prompt exists, else "pixabay")
-        },
-        ...
-    ]
+    Executes the video assembly pipeline and emits each intermediate asset:
+    - (artifact_callback: callable(artifact_type, file_path, caption))
     """
-    # Parse JSON if passed as string
-    if isinstance(script_data, str):
-        scenes = json.loads(script_data)
-    else:
-        scenes = script_data
-
-    if not scenes or not isinstance(scenes, list):
-        raise ValueError("Script must be a non-empty JSON array of scene objects.")
-
-    run_id = f"run_{int(time.time())}"
-    run_temp_dir = os.path.join(TEMP_DIR, run_id)
+    start_time = time.time()
+    run_temp_dir = os.path.join(temp_dir, f"run_{int(start_time)}")
     os.makedirs(run_temp_dir, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     available_bgs = get_available_backgrounds()
+    if not available_bgs:
+        raise RuntimeError("No background video files found in assets/backgrounds/")
+
     scene_video_paths = []
+    bg_cycle_idx = 0
+    anim_cycle_idx = 0
+    total_scenes = len(script_data)
 
-    total_scenes = len(scenes)
-    bg_counter = 0
-    animation_counter = 0
-
-    print(f"\n=======================================================")
-    print(f"Starting Video Engine Pipeline: {total_scenes} Scenes")
-    print(f"=======================================================\n")
+    logger.info(f"Starting pipeline execution for {total_scenes} scenes.")
 
     try:
-        for idx, scene in enumerate(scenes, start=1):
-            scene_text = scene.get("sentence", "").strip()
+        for idx, scene in enumerate(script_data):
+            scene_num = idx + 1
+            scene_prefix = f"scene_{scene_num:02d}"
+
+            sentence = scene.get("sentence", "").strip()
             query_text = scene.get("query", "").strip()
             prompt_text = scene.get("prompt", "").strip()
-            source_pref = scene.get("source", "").lower()
+            headline_data = scene.get("headline", None)
 
-            if not scene_text:
+            if not sentence:
                 continue
 
-            scene_prefix = f"scene_{idx:03d}"
-            audio_path = os.path.join(run_temp_dir, f"{scene_prefix}_audio.wav")
-            scene_mp4 = os.path.join(run_temp_dir, f"{scene_prefix}_final.mp4")
-
+            # -------------------------------------------------------------
+            # STEP A: Generate TTS Audio & Emit Artifact
+            # -------------------------------------------------------------
+            logger.info(f"[{scene_prefix}] Generating Cartesia TTS voiceover...")
             if progress_callback:
-                progress_callback(idx, total_scenes, f"Synthesizing audio for Scene {idx}/{total_scenes}...")
+                progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
 
-            # 1. Synthesize Cartesia Speech
-            tts_duration = await generate_speech(
-                text=scene_text,
-                output_wav_path=audio_path,
-                voice_name=voice_name
-            )
+            audio_path = os.path.join(run_temp_dir, f"{scene_prefix}_tts.wav")
+            audio_path, duration = generate_speech(sentence, audio_path)
+
+            if artifact_callback:
+                artifact_callback("audio", audio_path, f"🎤 Scene {scene_num} Audio ({duration:.1f}s)")
+
+            # Determine scene pattern: 0 = Video, 1 = BG + Image, 2 = Kinetic Animation
+            scene_mode = idx % 3
+            rendered_scene_mp4 = os.path.join(run_temp_dir, f"{scene_prefix}_rendered.mp4")
 
             # -------------------------------------------------------------
-            # SENTENCE 1: Standalone Unique Pixabay Landscape Video
+            # SCENE MODE 0: LANDSCAPE B-ROLL VIDEO (Scenes 1, 4, 7...)
             # -------------------------------------------------------------
-            if idx == 1:
+            if scene_mode == 0:
+                logger.info(f"[{scene_prefix}] Mode 0: Landscape B-Roll Video")
                 if progress_callback:
-                    progress_callback(idx, total_scenes, f"Downloading Pixabay landscape video for Scene 1...")
+                    progress_callback(f"Scene {scene_num}/{total_scenes}: Fetching Landscape Footage...")
 
+                video_search_query = query_text or prompt_text or "cinematic nature space abstract"
                 raw_video_path = os.path.join(run_temp_dir, f"{scene_prefix}_raw_video.mp4")
-                search_q = query_text if query_text else prompt_text
-                fetch_landscape_video(search_q, raw_video_path)
+                fetch_landscape_video(video_search_query, raw_video_path)
 
                 render_individual_scene(
-                    scene_type="standalone",
-                    visual_path=raw_video_path,
+                    scene_type="video",
                     audio_path=audio_path,
-                    duration_sec=tts_duration,
-                    output_path=scene_mp4
+                    output_path=rendered_scene_mp4,
+                    video_path=raw_video_path
                 )
-                scene_video_paths.append(scene_mp4)
 
             # -------------------------------------------------------------
-            # SENTENCE 2, 4, 6...: Background Video + Scaled Centered Image
+            # SCENE MODE 1: BACKGROUND LOOP + STAMP IMAGE + HEADLINE (Scenes 2, 5...)
             # -------------------------------------------------------------
-            elif idx % 2 == 0:
+            elif scene_mode == 1:
+                logger.info(f"[{scene_prefix}] Mode 1: Animated Background + Stamp Image")
                 if progress_callback:
-                    progress_callback(idx, total_scenes, f"Acquiring image & compositing background for Scene {idx}...")
+                    progress_callback(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp Drop...")
 
-                # Fetch/Generate Image Asset
-                image_path = os.path.join(run_temp_dir, f"{scene_prefix}_image.jpg")
-                if (source_pref == "bing" or prompt_text) and bing_cookie_u:
-                    await generate_bing_image(prompt_text or query_text, image_path, bing_cookie_u)
-                else:
-                    fetch_image(query_text or prompt_text, image_path)
+                # Intelligent AI vs Fetch Evaluation
+                chosen_source = evaluate_image_source_decision(scene)
+                raw_img_path = os.path.join(run_temp_dir, f"{scene_prefix}_image.jpg")
 
-                # Select rotating background video
-                if available_bgs:
-                    selected_bg = available_bgs[bg_counter % len(available_bgs)]
-                    bg_counter += 1
+                if chosen_source == "bing" and prompt_text:
+                    logger.info(f"[{scene_prefix}] Abstract prompt detected. Generating via Bing MAI1 AI...")
+                    generate_bing_image(prompt_text, raw_img_path, cookie_u=bing_cookie)
                 else:
-                    raise FileNotFoundError("No background video files found in assets/backgrounds/")
+                    logger.info(f"[{scene_prefix}] Fetching stock image from Wikimedia Commons...")
+                    try:
+                        fetch_image(query_text or prompt_text, raw_img_path)
+                    except Exception as e:
+                        logger.warning(f"Image fetch failed ({e}). Fallback to Bing AI...")
+                        generate_bing_image(prompt_text or query_text, raw_img_path, cookie_u=bing_cookie)
+
+                # Emit Image Artifact to Telegram
+                if artifact_callback and os.path.exists(raw_img_path):
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image ({chosen_source.upper()})")
+
+                # Pick next looping background
+                bg_loop_video = available_bgs[bg_cycle_idx % len(available_bgs)]
+                bg_cycle_idx += 1
 
                 render_individual_scene(
-                    scene_type="bg_image",
-                    visual_path=image_path,
+                    scene_type="background_with_image",
                     audio_path=audio_path,
-                    duration_sec=tts_duration,
-                    output_path=scene_mp4,
-                    bg_video_path=selected_bg
+                    output_path=rendered_scene_mp4,
+                    background_video_path=bg_loop_video,
+                    foreground_image_path=raw_img_path,
+                    headline_data=headline_data
                 )
-                scene_video_paths.append(scene_mp4)
 
             # -------------------------------------------------------------
-            # SENTENCE 3, 5, 7...: Procedural Kinetic OpenCV Animation
+            # SCENE MODE 2: PROCEDURAL OPENCV KINETIC ANIMATION (Scenes 3, 6...)
             # -------------------------------------------------------------
-            else:
+            elif scene_mode == 2:
+                logger.info(f"[{scene_prefix}] Mode 2: Kinetic Animation (Strict AI Generation)")
                 if progress_callback:
-                    progress_callback(idx, total_scenes, f"Rendering kinetic animation for Scene {idx}...")
+                    progress_callback(f"Scene {scene_num}/{total_scenes}: Generating AI Art & Kinetic Animation...")
 
-                # Fetch/Generate Image Asset for the Animation
-                image_path = os.path.join(run_temp_dir, f"{scene_prefix}_anim_image.jpg")
-                if (source_pref == "bing" or prompt_text) and bing_cookie_u:
-                    await generate_bing_image(prompt_text or query_text, image_path, bing_cookie_u)
-                else:
-                    fetch_image(query_text or prompt_text, image_path)
+                # Mode 2 strictly uses AI generation
+                raw_img_path = os.path.join(run_temp_dir, f"{scene_prefix}_ai_image.jpg")
+                generate_bing_image(prompt_text or query_text, raw_img_path, cookie_u=bing_cookie)
 
-                # Render procedural animation with exact TTS audio duration
-                raw_anim_video = os.path.join(run_temp_dir, f"{scene_prefix}_raw_anim.mp4")
+                # Emit AI Image Artifact to Telegram
+                if artifact_callback and os.path.exists(raw_img_path):
+                    artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} AI Art for Animation")
+
+                anim_video_path = os.path.join(run_temp_dir, f"{scene_prefix}_animation.mp4")
                 render_animation_by_index(
-                    image_path=image_path,
-                    output_path=raw_anim_video,
-                    duration_sec=tts_duration,
-                    cycle_index=animation_counter
+                    index=anim_cycle_idx,
+                    image_path=raw_img_path,
+                    output_path=anim_video_path,
+                    duration=duration
                 )
-                animation_counter += 1
+                anim_cycle_idx += 1
 
-                # Mux with audio and apply standard 0.4s fade-out
                 render_individual_scene(
                     scene_type="animation",
-                    visual_path=raw_anim_video,
                     audio_path=audio_path,
-                    duration_sec=tts_duration,
-                    output_path=scene_mp4
+                    output_path=rendered_scene_mp4,
+                    animation_video_path=anim_video_path
                 )
-                scene_video_paths.append(scene_mp4)
 
-        # -------------------------------------------------------------
-        # FINAL ZERO-LOSS STITCHING PASS
-        # -------------------------------------------------------------
+            # Emit Scene Video Artifact to Telegram
+            if artifact_callback and os.path.exists(rendered_scene_mp4):
+                artifact_callback("video", rendered_scene_mp4, f"🎬 Scene {scene_num} Rendered MP4")
+
+            scene_video_paths.append(rendered_scene_mp4)
+
+        # -----------------------------------------------------------------
+        # STEP B: Concatenate All Scenes
+        # -----------------------------------------------------------------
+        logger.info("Concatenating all intermediate scenes...")
         if progress_callback:
-            progress_callback(total_scenes, total_scenes, "Merging all scenes into final master video...")
+            progress_callback("Concatenating all rendered scenes...")
 
-        final_master_path = os.path.join(OUTPUT_DIR, f"master_{run_id}.mp4")
-        concat_all_scenes(scene_video_paths, final_master_path, run_temp_dir)
+        concat_all_scenes(scene_video_paths, output_video_path)
 
-        print(f"\nPipeline Finished! Master video: {final_master_path}")
-        return final_master_path
+        if artifact_callback and os.path.exists(output_video_path):
+            artifact_callback("final_video", output_video_path, "🏆 Final Full Combined Video")
+
+        return output_video_path
 
     finally:
-        # Automatic temporary file cleanup
-        try:
+        if os.path.exists(run_temp_dir):
             shutil.rmtree(run_temp_dir, ignore_errors=True)
-            print(f"Purged session temp directory: {run_temp_dir}")
-        except Exception as e:
-            print(f"Temp cleanup notice: {e}")
