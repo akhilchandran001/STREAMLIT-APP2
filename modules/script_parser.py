@@ -12,6 +12,11 @@ import time
 import cv2
 import numpy as np
 
+# Headless Matplotlib configuration for formula rendering
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from modules.cartesia_tts import generate_speech
 from modules.pixabay_fetcher import fetch_landscape_video, fetch_image
 from modules.bing_fetcher import run_sync_generate
@@ -47,13 +52,89 @@ ABSTRACT_AI_KEYWORDS = {
 
 def compute_scene_hash(scene: dict) -> str:
     """Produces a deterministic 12-character hash for cache verification."""
-    raw = f"{scene.get('sentence', '')}_{scene.get('prompt', '')}_{scene.get('query', '')}_{json.dumps(scene.get('headline', ''))}"
+    raw = f"{scene.get('sentence', '')}_{scene.get('prompt', '')}_{scene.get('query', '')}_{scene.get('equation', '')}_{json.dumps(scene.get('headline', ''))}"
     return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
 
 
 def is_valid_media_file(file_path: str, min_size_bytes: int = 15000) -> bool:
     """Checks if a file exists, is non-empty, and has valid media content."""
     return os.path.exists(file_path) and os.path.getsize(file_path) >= min_size_bytes
+
+
+def render_cinematic_equation_card(
+    latex_equation: str,
+    output_path: str,
+    formula_name: str = "",
+    width: int = 1760,
+    height: int = 870
+) -> str:
+    """
+    Renders an exact LaTeX formula onto a dark obsidian cinematic card.
+    Uses Matplotlib's native Computer Modern mathtext parser.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    clean_expr = latex_equation.strip()
+    if not clean_expr.startswith("$"):
+        clean_expr = f"${clean_expr}$"
+
+    fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="none")
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    ax.patch.set_alpha(0.0)
+
+    # Main formula text
+    ax.text(
+        0.5, 0.50, clean_expr,
+        fontsize=48,
+        color="#FFFFFF",
+        ha="center", va="center",
+        usetex=False
+    )
+
+    # Optional formula label
+    if formula_name:
+        ax.text(
+            0.5, 0.18, formula_name.upper(),
+            fontsize=22,
+            color="#DC2644",
+            fontweight="bold",
+            ha="center", va="center"
+        )
+
+    fig.canvas.draw()
+    rgba_buffer = np.asarray(fig.canvas.buffer_rgba())
+    plt.close(fig)
+
+    formula_bgr = cv2.cvtColor(rgba_buffer, cv2.COLOR_RGBA2BGR)
+    formula_alpha = rgba_buffer[:, :, 3] / 255.0
+
+    # Build dark obsidian background with radial gradient
+    y_coords, x_coords = np.mgrid[0:height, 0:width].astype(np.float32)
+    cx, cy = width * 0.5, height * 0.5
+    r = np.sqrt((x_coords - cx) ** 2 + (y_coords - cy) ** 2) / np.sqrt(cx ** 2 + cy ** 2)
+    gradient = np.clip(1.0 - 0.50 * r, 0.0, 1.0)[:, :, np.newaxis]
+
+    dark_tone = np.array([26, 22, 18], dtype=np.float32)
+    ambient_tone = np.array([10, 8, 8], dtype=np.float32)
+    card_surface = (ambient_tone + (dark_tone - ambient_tone) * gradient).astype(np.uint8)
+
+    # Gridlines for scientific aesthetic
+    card_surface[::60, :, :] = np.clip(card_surface[::60, :, :].astype(np.int16) + 12, 0, 255).astype(np.uint8)
+    card_surface[:, ::60, :] = np.clip(card_surface[:, ::60, :].astype(np.int16) + 12, 0, 255).astype(np.uint8)
+
+    # Composite formula with subtle glow
+    alpha_3ch = formula_alpha[:, :, np.newaxis]
+    final_card = (card_surface * (1.0 - alpha_3ch) + formula_bgr * alpha_3ch).astype(np.uint8)
+
+    glow_mask = (formula_alpha * 255).astype(np.uint8)
+    glow_blurred = cv2.GaussianBlur(glow_mask, (31, 31), 0)
+    glow_layer = (glow_blurred[:, :, np.newaxis] / 255.0) * np.array([120, 40, 20], dtype=np.float32)
+    final_card = np.clip(final_card.astype(np.float32) + glow_layer, 0, 255).astype(np.uint8)
+
+    cv2.imwrite(output_path, final_card)
+    logger.info(f"[EquationRenderer] Rendered exact math card: {output_path}")
+    return output_path
 
 
 def _execute_tts_with_retry(sentence: str, target_audio_path: str, voice_name: str = None) -> tuple[str, float]:
@@ -105,6 +186,14 @@ def generate_emergency_fallback_image(output_path: str):
 
 def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
     """Acquires image using intelligent routing with complete two-way fallback."""
+    # Priority 0: Exact Equation Card Bypass
+    if "equation" in scene and str(scene.get("equation", "")).strip():
+        logger.info(f"[ImageAcquisition] Equation detected. Rendering local math card...")
+        formula_latex = str(scene["equation"]).strip()
+        formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
+        render_cinematic_equation_card(formula_latex, raw_img_path, formula_name=formula_name)
+        return raw_img_path
+
     explicit = str(scene.get("image_source") or scene.get("source") or "").lower().strip()
     prompt_text = scene.get("prompt", "").strip()
     query_text = scene.get("query", "").strip()
@@ -170,10 +259,11 @@ def process_video_pipeline(
 ) -> str:
     """
     Executes the video pipeline with:
-    - Resumable scene caching (never re-does completed work).
+    - Resumable scene caching (skips completed work).
     - Multi-cookie Bing rotation.
     - Zero-crash background video fallback.
-    - Cooldown rest intervals between scenes to protect CPU and prevent throttling.
+    - Native LaTeX equation card rendering.
+    - Cooldown intervals between scenes.
     """
     start_time = time.time()
     effective_cookie = bing_cookie or bing_cookie_u
@@ -202,9 +292,7 @@ def process_video_pipeline(
         # Persistent Checkpoint Cache Path
         cached_scene_mp4 = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_rendered.mp4")
 
-        # -----------------------------------------------------------------
         # STEP 0: Checkpoint Hit Check (Instant Resume)
-        # -----------------------------------------------------------------
         if is_valid_media_file(cached_scene_mp4, 50000):
             logger.info(f"[{scene_prefix}] Found cached completed render. Reusing...")
             if progress_callback:
@@ -250,7 +338,6 @@ def process_video_pipeline(
             video_search_query = query_text or prompt_text or "space"
             raw_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_raw_video.mp4")
 
-            # Try online stock fetch with fallback to local background loop
             if not is_valid_media_file(raw_video_path, 20000):
                 try:
                     fetch_landscape_video(video_search_query, raw_video_path)
@@ -267,7 +354,7 @@ def process_video_pipeline(
             )
 
         # -----------------------------------------------------------------
-        # MODE 1: BACKGROUND LOOP + STAMP IMAGE + HEADLINE
+        # MODE 1: BACKGROUND LOOP + STAMP CARD (IMAGE OR FORMULA)
         # -----------------------------------------------------------------
         elif scene_mode == 1:
             logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
@@ -279,7 +366,7 @@ def process_video_pipeline(
                 acquire_scene_image(scene, raw_img_path, effective_cookie)
 
             if artifact_callback and is_valid_media_file(raw_img_path):
-                artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image")
+                artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Card")
 
             bg_loop_video = available_bgs[bg_cycle_idx % len(available_bgs)]
             bg_cycle_idx += 1
@@ -294,31 +381,37 @@ def process_video_pipeline(
             )
 
         # -----------------------------------------------------------------
-        # MODE 2: KINETIC ANIMATION (STRICT AI + FALLBACK)
+        # MODE 2: KINETIC ANIMATION (IMAGE OR FORMULA)
         # -----------------------------------------------------------------
         elif scene_mode == 2:
             logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
             if progress_callback:
-                progress_callback(f"Scene {scene_num}/{total_scenes}: Generating AI Art & Animation...")
+                progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Visual & Animation...")
 
             raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_ai_image.jpg")
             if not is_valid_media_file(raw_img_path, 5000):
-                acquired = False
-                if prompt_text:
-                    try:
-                        run_sync_generate(prompt_text, raw_img_path, cookie_u=effective_cookie)
-                        acquired = is_valid_media_file(raw_img_path)
-                    except Exception as e:
-                        logger.warning(f"Bing AI failed ({e}). Trying fallback...")
+                # Check for equation in Mode 2
+                if "equation" in scene and str(scene.get("equation", "")).strip():
+                    formula_latex = str(scene["equation"]).strip()
+                    formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
+                    render_cinematic_equation_card(formula_latex, raw_img_path, formula_name=formula_name)
+                else:
+                    acquired = False
+                    if prompt_text:
+                        try:
+                            run_sync_generate(prompt_text, raw_img_path, cookie_u=effective_cookie)
+                            acquired = is_valid_media_file(raw_img_path)
+                        except Exception as e:
+                            logger.warning(f"Bing AI failed ({e}). Trying fallback...")
 
-                if not acquired:
-                    try:
-                        fetch_image(query_text or prompt_text, raw_img_path)
-                    except Exception:
-                        generate_emergency_fallback_image(raw_img_path)
+                    if not acquired:
+                        try:
+                            fetch_image(query_text or prompt_text, raw_img_path)
+                        except Exception:
+                            generate_emergency_fallback_image(raw_img_path)
 
             if artifact_callback and is_valid_media_file(raw_img_path):
-                artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} AI Art")
+                artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} Visual")
 
             anim_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_animation.mp4")
             render_animation_by_index(
@@ -342,9 +435,7 @@ def process_video_pipeline(
 
         scene_video_paths.append(rendered_scene_mp4)
 
-        # -----------------------------------------------------------------
-        # Rest / Cooldown Heartbeat (Only between scenes, not after the last)
-        # -----------------------------------------------------------------
+        # Rest / Cooldown Heartbeat between scenes
         if scene_num < total_scenes and rest_seconds_between_scenes > 0:
             logger.info(f"Resting for {rest_seconds_between_scenes}s to cool down CPU and Bing cookie...")
             for remaining in range(rest_seconds_between_scenes, 0, -5):
