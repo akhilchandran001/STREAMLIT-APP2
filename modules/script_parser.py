@@ -5,13 +5,15 @@ import inspect
 import json
 import logging
 import os
-import re
 import shutil
 import time
 
+import cv2
+import numpy as np
+
 from modules.cartesia_tts import generate_speech
 from modules.pixabay_fetcher import fetch_landscape_video, fetch_image
-from modules.bing_fetcher import generate_bing_image
+from modules.bing_fetcher import run_sync_generate
 from animations.animation_router import render_animation_by_index
 from modules.ffmpeg_compositor import (
     render_individual_scene,
@@ -19,9 +21,6 @@ from modules.ffmpeg_compositor import (
     get_stream_duration
 )
 
-# =====================================================================
-# DIRECTORY CONSTANTS (Exported for app.py and Telegram bot)
-# =====================================================================
 BG_DIR = "assets/backgrounds"
 OUTPUT_DIR = "outputs"
 
@@ -44,38 +43,87 @@ ABSTRACT_AI_KEYWORDS = {
 
 
 def _execute_tts(sentence: str, target_audio_path: str) -> tuple[str, float]:
-    """
-    Safely executes generate_speech whether it is an async coroutine or a sync function,
-    and returns (audio_path, duration_in_seconds).
-    """
+    """Safely executes generate_speech whether it is an async coroutine or sync function."""
     res = generate_speech(sentence, target_audio_path)
 
-    # Resolve coroutine if generate_speech is an async def
     if inspect.iscoroutine(res):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor() as pool:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     res = pool.submit(asyncio.run, res).result()
             else:
                 res = loop.run_until_complete(res)
         except RuntimeError:
             res = asyncio.run(res)
 
-    # Parse return format safely
     if isinstance(res, (tuple, list)) and len(res) == 2:
-        out_path, dur = res
-        return str(out_path), float(dur)
+        return str(res[0]), float(res[1])
     elif isinstance(res, str) and os.path.exists(res):
-        dur = get_stream_duration(res)
-        return res, dur
+        return res, get_stream_duration(res)
     else:
-        dur = get_stream_duration(target_audio_path)
-        return target_audio_path, dur
+        return target_audio_path, get_stream_duration(target_audio_path)
+
+
+def generate_emergency_fallback_image(output_path: str):
+    """Generates an emergency gradient card so pipeline never crashes on missing files."""
+    h, w = 1080, 1920
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    for y in range(h):
+        ratio = y / h
+        canvas[y, :] = [int(35 * (1 - ratio)), int(20 * (1 - ratio)), int(45 * ratio + 15)]
+    cv2.circle(canvas, (w // 2, h // 2), 220, (180, 80, 20), -1)
+    canvas = cv2.GaussianBlur(canvas, (101, 101), 0)
+    cv2.imwrite(output_path, canvas)
+
+
+def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
+    """Acquires image using intelligent routing with complete two-way fallback."""
+    explicit = str(scene.get("image_source") or scene.get("source") or "").lower().strip()
+    prompt_text = scene.get("prompt", "").strip()
+    query_text = scene.get("query", "").strip()
+    search_q = query_text or prompt_text
+
+    combined_text = f"{prompt_text.lower()} {query_text.lower()}"
+    prefer_ai = explicit in ["bing", "ai", "dall-e"] or any(k in combined_text for k in ABSTRACT_AI_KEYWORDS)
+
+    if prefer_ai and prompt_text:
+        try:
+            logger.info(f"[ImageAcquisition] Trying Bing AI for: '{prompt_text}'")
+            run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
+            if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000:
+                return raw_img_path
+        except Exception as e:
+            logger.warning(f"[ImageAcquisition] Bing AI failed ({e}). Falling back to Wikimedia...")
+
+        try:
+            fetch_image(search_q, raw_img_path)
+            if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000:
+                return raw_img_path
+        except Exception as e2:
+            logger.warning(f"[ImageAcquisition] Wikimedia fallback failed ({e2}). Using emergency card.")
+    else:
+        try:
+            logger.info(f"[ImageAcquisition] Trying Wikimedia Commons for: '{search_q}'")
+            fetch_image(search_q, raw_img_path)
+            if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000:
+                return raw_img_path
+        except Exception as e:
+            logger.warning(f"[ImageAcquisition] Wikimedia failed ({e}). Falling back to Bing AI...")
+
+        if prompt_text:
+            try:
+                run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
+                if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000:
+                    return raw_img_path
+            except Exception as e2:
+                logger.warning(f"[ImageAcquisition] Bing AI fallback failed ({e2}). Using emergency card.")
+
+    generate_emergency_fallback_image(raw_img_path)
+    return raw_img_path
 
 
 def get_available_backgrounds(assets_dir: str = BG_DIR) -> list[str]:
-    """Locates all looping background MP4s inside the assets directory."""
     patterns = [os.path.join(assets_dir, "*.mp4"), os.path.join(assets_dir, "*.MP4")]
     files = []
     for p in patterns:
@@ -83,54 +131,28 @@ def get_available_backgrounds(assets_dir: str = BG_DIR) -> list[str]:
     return sorted(files)
 
 
-def evaluate_image_source_decision(scene: dict) -> str:
-    """Intelligently determines whether an image should be AI-generated or fetched."""
-    explicit = scene.get("image_source") or scene.get("source")
-    if explicit:
-        val = str(explicit).lower().strip()
-        if val in ["bing", "ai", "dall-e", "dalle", "gen"]:
-            return "bing"
-        if val in ["fetch", "wikimedia", "scrape", "stock"]:
-            return "fetch"
-
-    prompt_text = scene.get("prompt", "").lower()
-    query_text = scene.get("query", "").lower()
-    combined_text = f"{prompt_text} {query_text}"
-
-    if any(kw in combined_text for kw in ABSTRACT_AI_KEYWORDS):
-        return "bing"
-
-    return "fetch"
-
-
 def process_video_pipeline(
     script_data: list[dict],
     output_video_path: str,
     temp_dir: str = "temp_pipeline",
-    bing_cookie: str = "",
+    bing_cookie=None,
     progress_callback=None,
     artifact_callback=None
 ) -> str:
-    """
-    Renders video following the 3-beat cycle:
-      - Scene (i % 3 == 0): Landscape Video (Mixkit / Wikimedia)
-      - Scene (i % 3 == 1): BG Loop + Centered Image + Headline (Type 2)
-      - Scene (i % 3 == 2): Procedural OpenCV Kinetic Animation (Strict AI)
-    """
     start_time = time.time()
     run_temp_dir = os.path.join(temp_dir, f"run_{int(start_time)}")
     os.makedirs(run_temp_dir, exist_ok=True)
 
     available_bgs = get_available_backgrounds(BG_DIR)
     if not available_bgs:
-        raise RuntimeError(f"No looping background videos found in '{BG_DIR}/'.")
+        raise RuntimeError(f"No background videos found in '{BG_DIR}/'.")
 
     scene_video_paths = []
     bg_cycle_idx = 0
     anim_cycle_idx = 0
     total_scenes = len(script_data)
 
-    logger.info(f"Pipeline started for {total_scenes} scenes in: {run_temp_dir}")
+    logger.info(f"Pipeline started for {total_scenes} scenes.")
 
     try:
         for idx, scene in enumerate(script_data):
@@ -145,12 +167,10 @@ def process_video_pipeline(
             if not sentence:
                 continue
 
-            # -------------------------------------------------------------
-            # STEP 1: TTS Audio Generation (Async-Safe)
-            # -------------------------------------------------------------
+            # 1. Voiceover
             logger.info(f"[{scene_prefix}] Generating Voiceover...")
             if progress_callback:
-                progress_callback(f"Scene {scene_num}/{total_scenes}: Synthesizing Voiceover...")
+                progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
 
             audio_target = os.path.join(run_temp_dir, f"{scene_prefix}_tts.wav")
             audio_path, duration = _execute_tts(sentence, audio_target)
@@ -161,15 +181,13 @@ def process_video_pipeline(
             scene_mode = idx % 3
             rendered_scene_mp4 = os.path.join(run_temp_dir, f"{scene_prefix}_rendered.mp4")
 
-            # -------------------------------------------------------------
             # MODE 0: LANDSCAPE B-ROLL VIDEO
-            # -------------------------------------------------------------
             if scene_mode == 0:
                 logger.info(f"[{scene_prefix}] Rendering Landscape Video")
                 if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Fetching Cinematic Footage...")
+                    progress_callback(f"Scene {scene_num}/{total_scenes}: Fetching Video Footage...")
 
-                video_search_query = query_text or prompt_text or "cinematic nature space abstract"
+                video_search_query = query_text or prompt_text or "cinematic nature space"
                 raw_video_path = os.path.join(run_temp_dir, f"{scene_prefix}_raw_video.mp4")
                 fetch_landscape_video(video_search_query, raw_video_path)
 
@@ -180,28 +198,17 @@ def process_video_pipeline(
                     video_path=raw_video_path
                 )
 
-            # -------------------------------------------------------------
             # MODE 1: BACKGROUND LOOP + STAMP IMAGE + HEADLINE
-            # -------------------------------------------------------------
             elif scene_mode == 1:
                 logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
                 if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Sourcing Image & Rendering Stamp...")
+                    progress_callback(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp...")
 
-                chosen_source = evaluate_image_source_decision(scene)
                 raw_img_path = os.path.join(run_temp_dir, f"{scene_prefix}_image.jpg")
-
-                if chosen_source == "bing" and prompt_text:
-                    generate_bing_image(prompt_text, raw_img_path, cookie_u=bing_cookie)
-                else:
-                    try:
-                        fetch_image(query_text or prompt_text, raw_img_path)
-                    except Exception as err:
-                        logger.warning(f"Fetch failed ({err}). Falling back to Bing AI...")
-                        generate_bing_image(prompt_text or query_text, raw_img_path, cookie_u=bing_cookie)
+                acquire_scene_image(scene, raw_img_path, bing_cookie)
 
                 if artifact_callback and os.path.exists(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image ({chosen_source.upper()})")
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image")
 
                 bg_loop_video = available_bgs[bg_cycle_idx % len(available_bgs)]
                 bg_cycle_idx += 1
@@ -215,19 +222,29 @@ def process_video_pipeline(
                     headline_data=headline_data
                 )
 
-            # -------------------------------------------------------------
-            # MODE 2: KINETIC ANIMATION (STRICT AI)
-            # -------------------------------------------------------------
+            # MODE 2: KINETIC ANIMATION (STRICT AI + FALLBACK)
             elif scene_mode == 2:
                 logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
                 if progress_callback:
                     progress_callback(f"Scene {scene_num}/{total_scenes}: Generating AI Art & Animation...")
 
                 raw_img_path = os.path.join(run_temp_dir, f"{scene_prefix}_ai_image.jpg")
-                generate_bing_image(prompt_text or query_text, raw_img_path, cookie_u=bing_cookie)
+                acquired = False
+                if prompt_text:
+                    try:
+                        run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookie)
+                        acquired = os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000
+                    except Exception as e:
+                        logger.warning(f"Bing AI failed for Type 3 ({e}). Trying Wikimedia fallback...")
+
+                if not acquired:
+                    try:
+                        fetch_image(query_text or prompt_text, raw_img_path)
+                    except Exception:
+                        generate_emergency_fallback_image(raw_img_path)
 
                 if artifact_callback and os.path.exists(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} AI Art for Animation")
+                    artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} AI Art")
 
                 anim_video_path = os.path.join(run_temp_dir, f"{scene_prefix}_animation.mp4")
                 render_animation_by_index(
@@ -245,15 +262,11 @@ def process_video_pipeline(
                     animation_video_path=anim_video_path
                 )
 
-            # Emit Scene Video Artifact
             if artifact_callback and os.path.exists(rendered_scene_mp4):
                 artifact_callback("video", rendered_scene_mp4, f"🎬 Scene {scene_num} Rendered MP4")
 
             scene_video_paths.append(rendered_scene_mp4)
 
-        # -----------------------------------------------------------------
-        # STEP 2: Concat All Scenes
-        # -----------------------------------------------------------------
         logger.info(f"Concatenating {len(scene_video_paths)} scenes...")
         if progress_callback:
             progress_callback("Concatenating all scenes into final video...")
