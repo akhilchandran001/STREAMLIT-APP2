@@ -37,7 +37,7 @@ async def safe_edit_message(message: Message, text: str):
 
 
 async def execute_pipeline_for_user(client: Client, message: Message, script_data: list):
-    """Orchestrates pipeline execution, status progress, and real-time artifact delivery."""
+    """Orchestrates pipeline execution, status updates, and guaranteed delivery."""
     chat_id = message.chat.id
     status_msg = await message.reply_text("🚀 Pipeline Initialized! Processing script...")
 
@@ -48,30 +48,52 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
 
     loop = asyncio.get_running_loop()
 
-    # Thread-safe progress callback
+    # Thread-safe progress status updater
     def progress_callback(status_text: str):
         asyncio.run_coroutine_threadsafe(
             safe_edit_message(status_msg, f"⏳ {status_text}"),
             loop
         )
 
-    # Thread-safe artifact dispatcher
+    # Thread-safe artifact dispatcher that blocks worker thread until upload finishes
     def artifact_callback(artifact_type: str, file_path: str, caption: str):
-        async def _upload():
-            try:
-                if artifact_type == "audio":
-                    await client.send_audio(chat_id, audio=file_path, caption=caption)
-                elif artifact_type == "image":
-                    await client.send_photo(chat_id, photo=file_path, caption=caption)
-                elif artifact_type in ["video", "final_video"]:
-                    await client.send_video(chat_id, video=file_path, caption=caption, supports_streaming=True)
-            except Exception as err:
-                logger.error(f"Failed to upload {artifact_type} artifact: {err}")
+        if not os.path.exists(file_path):
+            logger.error(f"Cannot upload missing artifact: {file_path}")
+            return
 
-        asyncio.run_coroutine_threadsafe(_upload(), loop)
+        async def _upload():
+            for attempt in range(3):
+                try:
+                    if artifact_type == "audio":
+                        await client.send_audio(chat_id, audio=file_path, caption=caption)
+                    elif artifact_type == "image":
+                        await client.send_photo(chat_id, photo=file_path, caption=caption)
+                    elif artifact_type in ["video", "final_video"]:
+                        await client.send_video(
+                            chat_id,
+                            video=file_path,
+                            caption=caption,
+                            supports_streaming=True
+                        )
+                    return
+                except FloodWait as fw:
+                    logger.warning(f"FloodWait hit during {artifact_type} upload. Waiting {fw.value}s...")
+                    await asyncio.sleep(fw.value)
+                except Exception as err:
+                    logger.error(f"Upload attempt {attempt + 1} failed for {file_path}: {err}")
+                    if attempt == 2:
+                        raise err
+                    await asyncio.sleep(2)
+
+        # Dispatch upload to main loop and block worker thread until Telegram acknowledges receipt
+        future = asyncio.run_coroutine_threadsafe(_upload(), loop)
+        try:
+            future.result(timeout=300)  # Up to 5 minutes for large video uploads
+        except Exception as e:
+            logger.error(f"Artifact upload timed out or failed permanently for {file_path}: {e}")
 
     try:
-        # Run synchronous video generation in background thread
+        # Run synchronous video generation in executor thread
         await loop.run_in_executor(
             None,
             lambda: process_video_pipeline(
