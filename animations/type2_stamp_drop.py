@@ -5,20 +5,19 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# Theme Palettes
-COLOR_TEXT_BLACK = (20, 20, 20)       # #141414 For BG1 & BG3
-COLOR_TEXT_WHITE = (245, 245, 245)   # For all other / dark backgrounds
-COLOR_ACCENT_RED = (220, 38, 68)     # #DC2644 Crimson Red
-COLOR_BAR_RED    = (220, 38, 68)
+# High-Intensity Cinema Color Palette
+COLOR_PURE_BLACK   = (0, 0, 0)          # #000000
+COLOR_PURE_WHITE   = (255, 255, 255)    # #FFFFFF
+COLOR_VIBRANT_RED  = (235, 15, 45)      # #EB0F2D High-Intensity Crimson Red
 
 CANVAS_W = 1920
 CANVAS_H = 1080
 
 
-def _load_font_or_fallback(is_italic: bool = False, size: int = 72) -> tuple[ImageFont.FreeTypeFont, bool]:
+def _load_font_or_fallback(is_italic: bool = False, size: int = 70) -> tuple[ImageFont.FreeTypeFont, bool]:
     """
-    Checks assets/fonts/ first for user fonts, then system paths.
-    Returns (font, needs_synthetic_shear).
+    Loads custom user fonts from assets/fonts/ first, then checks system fallbacks.
+    Returns (font_object, needs_synthetic_shear).
     """
     font_dir = os.path.join(os.getcwd(), "assets", "fonts")
     if is_italic:
@@ -32,7 +31,6 @@ def _load_font_or_fallback(is_italic: bool = False, size: int = 72) -> tuple[Ima
                 except Exception:
                     pass
 
-        # Check system italic candidates
         sys_italic = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
@@ -46,7 +44,6 @@ def _load_font_or_fallback(is_italic: bool = False, size: int = 72) -> tuple[Ima
                 except Exception:
                     pass
 
-    # Bold / Regular candidates
     user_bold = glob.glob(os.path.join(font_dir, "*[bB]old*.ttf")) + \
                 glob.glob(os.path.join(font_dir, "*[bB]old*.otf")) + \
                 [os.path.join(font_dir, "Bold.ttf")]
@@ -76,44 +73,6 @@ def _load_font_or_fallback(is_italic: bool = False, size: int = 72) -> tuple[Ima
         return ImageFont.load_default(size=size), is_italic
     except Exception:
         return ImageFont.load_default(), is_italic
-
-
-def _draw_forward_italic_word(
-    word: str,
-    font: ImageFont.FreeTypeFont,
-    fill_color: tuple,
-    slant: float = 0.24
-) -> tuple[Image.Image, int, int]:
-    """
-    Renders text and applies a positive forward affine shear transformation
-    so italics lean forward to the right (standard typography).
-    """
-    dummy = Image.new("RGBA", (10, 10))
-    d = ImageDraw.Draw(dummy)
-    bbox = d.textbbox((0, 0), word, font=font)
-    tw = max(1, bbox[2] - bbox[0])
-    th = max(1, bbox[3] - bbox[1])
-
-    pad = int(th * abs(slant) + 20)
-    img_word = Image.new("RGBA", (tw + pad * 2, th + 24), (255, 255, 255, 0))
-    draw_w = ImageDraw.Draw(img_word)
-    draw_w.text((pad - bbox[0], 12 - bbox[1]), word, font=font, fill=fill_color)
-
-    # Positive shear for forward slant: x_src = x_dst + slant * (h - y_dst)
-    w_orig, h_orig = img_word.size
-    affine_matrix = (1.0, slant, -slant * h_orig, 0.0, 1.0, 0.0)
-    sheared = img_word.transform(
-        (w_orig + pad, h_orig),
-        Image.AFFINE,
-        affine_matrix,
-        resample=Image.BICUBIC
-    )
-
-    alpha = np.array(sheared)[:, :, 3]
-    cols = np.where(alpha.max(axis=0) > 0)[0]
-    if len(cols) > 0:
-        sheared = sheared.crop((cols[0], 0, cols[-1] + 1, h_orig))
-    return sheared, sheared.width, sheared.height
 
 
 def parse_headline_input(headline_input) -> tuple[str, str, str]:
@@ -150,76 +109,99 @@ def render_headline_banner(
     headline_data,
     bg_video_path: str = "",
     canvas_w: int = CANVAS_W,
-    banner_h: int = 150
+    banner_h: int = 140
 ) -> tuple[Image.Image, int]:
     """
-    Renders styled headline banner with contextual text coloring:
-    - Black text for BG1 and BG3
-    - White text for all other backgrounds
-    - Crimson Red for the highlighted italic word + anchored underline bar
+    Renders styled headline banner:
+    - High-intensity black/white text with intense red highlight.
+    - Mathematical baseline alignment so all three words sit on the exact same horizontal line.
+    - Contextual background plate (pure white for BG1/BG3, deep black for others).
     """
     prefix, highlight, suffix = parse_headline_input(headline_data)
-    banner = Image.new("RGBA", (canvas_w, banner_h), (255, 255, 255, 0))
+    banner = Image.new("RGBA", (canvas_w, banner_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(banner)
 
-    # Contextual color switching
+    # Determine theme based on background filename
     bg_name = os.path.basename(bg_video_path).upper() if bg_video_path else ""
-    if "BG1" in bg_name or "BG3" in bg_name:
-        text_color = COLOR_TEXT_BLACK
+    is_light_bg = ("BG1" in bg_name) or ("BG3" in bg_name)
+
+    if is_light_bg:
+        text_color = COLOR_PURE_BLACK
+        plate_color = (255, 255, 255, 240)       # High-opacity Pure White Plate
+        plate_border = (220, 220, 220, 255)
     else:
-        text_color = COLOR_TEXT_WHITE
+        text_color = COLOR_PURE_WHITE
+        plate_color = (0, 0, 0, 230)             # High-opacity Pitch Black Plate
+        plate_border = (50, 50, 50, 255)
 
     font_base, _ = _load_font_or_fallback(is_italic=False, size=68)
     font_italic, needs_shear = _load_font_or_fallback(is_italic=True, size=70)
 
-    def measure(txt: str, fnt):
+    def get_width(txt: str, fnt):
         if not txt:
             return 0
         b = draw.textbbox((0, 0), txt, font=fnt)
         return b[2] - b[0]
 
-    space_w = 18
-    w_prefix = measure(prefix, font_base) if prefix else 0
-    w_suffix = measure(suffix, font_base) if suffix else 0
+    space_w = 20
+    w_prefix = get_width(prefix, font_base) if prefix else 0
+    w_highlight = get_width(highlight, font_italic) if highlight else 0
+    w_suffix = get_width(suffix, font_base) if suffix else 0
 
-    highlight_img = None
-    if highlight:
-        if needs_shear:
-            highlight_img, w_highlight, _ = _draw_forward_italic_word(
-                highlight, font_base, COLOR_ACCENT_RED + (255,), slant=0.24
-            )
-        else:
-            w_highlight = measure(highlight, font_italic)
-    else:
-        w_highlight = 0
+    total_text_w = w_prefix + (space_w if prefix and (highlight or suffix) else 0) + \
+                   w_highlight + (space_w if highlight and suffix else 0) + w_suffix
 
-    total_w = w_prefix + (space_w if prefix and (highlight or suffix) else 0) + \
-              w_highlight + (space_w if highlight and suffix else 0) + w_suffix
-    start_x = max(20, (canvas_w - total_w) // 2)
-    baseline_y = 22
+    # Mathematical Baseline Lock:
+    # Uses capital 'H' baseline offset so Montserrat and Playfair sit on the exact same pixel line
+    target_baseline_y = 66
+    bbox_base_h = font_base.getbbox("H")
+    bbox_italic_h = font_italic.getbbox("H")
 
-    cur_x = start_x
+    y_base = target_baseline_y - bbox_base_h[3]
+    y_italic = target_baseline_y - bbox_italic_h[3]
+
+    # Draw Background Contrast Plate
+    plate_pad_x = 42
+    plate_pad_y = 12
+    plate_w = total_text_w + plate_pad_x * 2
+    plate_h = 92
+    plate_x1 = (canvas_w - plate_w) // 2
+    plate_y1 = max(6, target_baseline_y - 52)
+    plate_x2 = plate_x1 + plate_w
+    plate_y2 = plate_y1 + plate_h
+
+    # Rounded background plate
+    draw.rounded_rectangle(
+        [plate_x1, plate_y1, plate_x2, plate_y2],
+        radius=18,
+        fill=plate_color,
+        outline=plate_border,
+        width=2
+    )
+
+    cur_x = plate_x1 + plate_pad_x
+
+    # 1. Prefix
     if prefix:
-        draw.text((cur_x, baseline_y), prefix, font=font_base, fill=text_color + (255,))
+        draw.text((cur_x, y_base), prefix, font=font_base, fill=text_color + (255,))
         cur_x += w_prefix + space_w
 
-    highlight_x_start = cur_x
+    # 2. Highlight (Single-line baseline locked)
+    highlight_start_x = cur_x
     if highlight:
-        if highlight_img:
-            banner.paste(highlight_img, (cur_x, baseline_y - 6), highlight_img)
-        else:
-            draw.text((cur_x, baseline_y), highlight, font=font_italic, fill=COLOR_ACCENT_RED + (255,))
+        draw.text((cur_x, y_italic), highlight, font=font_italic, fill=COLOR_VIBRANT_RED + (255,))
         cur_x += w_highlight + space_w
 
+    # 3. Suffix
     if suffix:
-        draw.text((cur_x, baseline_y), suffix, font=font_base, fill=text_color + (255,))
+        draw.text((cur_x, y_base), suffix, font=font_base, fill=text_color + (255,))
 
-    # Underline bar anchored specifically beneath the highlighted word
+    # 4. Underline bar anchored directly below the highlighted word
     bar_width = max(90, w_highlight + 14)
-    bar_x1 = highlight_x_start + (w_highlight - bar_width) // 2 if highlight else (canvas_w - bar_width) // 2
+    bar_x1 = highlight_start_x + (w_highlight - bar_width) // 2 if highlight else (canvas_w - bar_width) // 2
     bar_x2 = bar_x1 + bar_width
-    bar_y = baseline_y + 80
-    draw.rounded_rectangle([bar_x1, bar_y, bar_x2, bar_y + 5], radius=3, fill=COLOR_BAR_RED + (255,))
+    bar_y = target_baseline_y + 14
+    draw.rounded_rectangle([bar_x1, bar_y, bar_x2, bar_y + 5], radius=3, fill=COLOR_VIBRANT_RED + (255,))
 
     return banner, bar_y + 5
 
@@ -236,7 +218,6 @@ def build_card_with_overlay(img_bgr: np.ndarray, target_w: int, target_h: int) -
     card = np.zeros((target_h, target_w, 4), dtype=np.uint8)
     mask = np.zeros((target_h, target_w), dtype=np.uint8)
 
-    # Rounded rectangle mask
     cv2.rectangle(mask, (radius, 0), (target_w - radius, target_h), 255, -1)
     cv2.rectangle(mask, (0, radius), (target_w, target_h - radius), 255, -1)
     cv2.circle(mask, (radius, radius), radius, 255, -1)
@@ -244,11 +225,10 @@ def build_card_with_overlay(img_bgr: np.ndarray, target_w: int, target_h: int) -
     cv2.circle(mask, (radius, target_h - radius), radius, 255, -1)
     cv2.circle(mask, (target_w - radius, target_h - radius), radius, 255, -1)
 
-    card[mask > 0, :3] = (248, 248, 248)
+    card[mask > 0, :3] = (255, 255, 255)
     card[mask > 0, 3] = 255
     card[border_px:border_px + inner_h, border_px:border_px + inner_w, :3] = scaled_photo
 
-    # Subtle inner bevel outline
     edges = cv2.Canny(mask, 100, 200)
     card[edges > 0, :3] = (220, 220, 220)
     return card
@@ -263,33 +243,32 @@ def build_vignette_mask(width: int = CANVAS_W, height: int = CANVAS_H) -> np.nda
     return np.clip(1.0 - 0.32 * radial_dist, 0.0, 1.0)[:, :, np.newaxis]
 
 
-def build_drop_shadow(card_rgba: np.ndarray, blur_radius: int = 39, opacity: float = 0.50) -> np.ndarray:
-    """Builds soft feathered drop shadow underneath the card."""
+def build_drop_shadow(card_rgba: np.ndarray, blur_radius: int = 41, opacity: float = 0.55) -> np.ndarray:
+    """Builds a soft feathered drop shadow underneath the card."""
     h, w = card_rgba.shape[:2]
     alpha = card_rgba[:, :, 3]
 
     pad = 70
     shadow = np.zeros((h + pad * 2, w + pad * 2, 4), dtype=np.uint8)
     shadow[pad:pad + h, pad:pad + w, 3] = (alpha.astype(np.float32) * opacity).astype(np.uint8)
-    shadow[:, :, :3] = (12, 12, 12)
+    shadow[:, :, :3] = (5, 5, 5)
 
     ksize = blur_radius if blur_radius % 2 == 1 else blur_radius + 1
     return cv2.GaussianBlur(shadow, (ksize, ksize), 0)
 
 
 def apply_card_specular_sheen(card_rgba: np.ndarray, progress: float) -> np.ndarray:
-    """Simulates diagonal sunlight gloss sweep across the card."""
+    """Simulates a diagonal sunlight gloss sweep across the card."""
     if progress < 0.0 or progress > 1.0:
         return card_rgba
 
     h, w = card_rgba.shape[:2]
-    center_x = int(progress * (w + 400) - 200)
+    center_x = int(progress * (w + 500) - 250)
 
-    # Lightweight grid evaluation
     step = 4
     grid_y, grid_x = np.mgrid[0:h:step, 0:w:step].astype(np.float32)
-    band = (grid_x - grid_y * 0.42) - center_x
-    sheen = np.exp(-((band / 70.0) ** 2)) * 45.0
+    band = (grid_x - grid_y * 0.45) - center_x
+    sheen = np.exp(-((band / 75.0) ** 2)) * 50.0
 
     sheen_full = cv2.resize(sheen, (w, h), interpolation=cv2.INTER_LINEAR)
     mask = (card_rgba[:, :, 3] > 0).astype(np.float32)
@@ -334,10 +313,10 @@ def render_animated_stamp_drop(
 ) -> str:
     """
     Renders an animated Type 2 scene:
-    - Maximum width and height card layout
-    - Contextual text color matching background
-    - Kinetic elastic slam (first 0.38s) followed by smooth continuous floating drift
-    - Tactile glass sheen sweep and cinematic vignette overlay
+    - Maximum dimensions (1760x870).
+    - Perfect horizontal baseline alignment between regular and italic fonts.
+    - Intense colors with contextual background plate.
+    - Dynamic floating hover and specular glass sheen.
     """
     total_frames = max(1, int(round(duration * fps)))
 
@@ -345,32 +324,32 @@ def render_animated_stamp_drop(
     if raw_img is None:
         raise ValueError(f"Could not load foreground image: {foreground_image_path}")
 
-    # Render headline banner
+    # Render headline banner and get underline coordinate
     banner_np = None
-    underline_bar_bottom_y = 95
+    underline_bar_bottom_y = 96
     if headline_data:
         banner_pil, underline_bar_bottom_y = render_headline_banner(
             headline_data=headline_data,
             bg_video_path=bg_video_path,
             canvas_w=CANVAS_W,
-            banner_h=140
+            banner_h=135
         )
         banner_np = cv2.cvtColor(np.array(banner_pil), cv2.COLOR_RGBA2BGRA)
 
     # Maximum image dimensions
-    max_w, max_h = 1720, 860
+    max_w, max_h = 1760, 870
     img_h, img_w = raw_img.shape[:2]
     scale_fit = min(max_w / img_w, max_h / img_h, 1.0)
     target_w = int(img_w * scale_fit)
     target_h = int(img_h * scale_fit)
 
     card_base = build_card_with_overlay(raw_img, target_w, target_h)
-    shadow_base = build_drop_shadow(card_base, blur_radius=39, opacity=0.50)
+    shadow_base = build_drop_shadow(card_base, blur_radius=41, opacity=0.55)
     vignette = build_vignette_mask(CANVAS_W, CANVAS_H)
 
-    # Position image card ~24px below underline bar
+    # Tight spacing: starts ~18px below underline bar
     center_x = CANVAS_W // 2
-    base_center_y = min(CANVAS_H - target_h // 2 - 16, underline_bar_bottom_y + 24 + target_h // 2)
+    base_center_y = min(CANVAS_H - target_h // 2 - 12, underline_bar_bottom_y + 18 + target_h // 2)
 
     bg_cap = cv2.VideoCapture(bg_video_path)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -386,12 +365,15 @@ def render_animated_stamp_drop(
             bg_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, bg_frame = bg_cap.read()
             if not ret:
-                bg_frame = np.full((CANVAS_H, CANVAS_W, 3), 20, dtype=np.uint8)
+                bg_frame = np.full((CANVAS_H, CANVAS_W, 3), 15, dtype=np.uint8)
 
         if (bg_frame.shape[1], bg_frame.shape[0]) != (CANVAS_W, CANVAS_H):
             bg_frame = cv2.resize(bg_frame, (CANVAS_W, CANVAS_H))
 
-        # Dynamic Kinematics: 0.38s Elastic Slam -> Continuous Ambient Floating Drift
+        # 1. Apply Vignette ONLY to the Background Frame (Preserves text and card color intensity)
+        bg_frame = np.clip(bg_frame.astype(np.float32) * vignette, 0, 255).astype(np.uint8)
+
+        # 2. Dynamic Kinematics: Elastic Slam -> Continuous Ambient Floating Drift
         if frame_idx < slam_frames:
             prog = frame_idx / max(slam_frames, 1)
             scale = 1.0 + 0.32 * math.exp(-6.0 * prog) * math.cos(prog * math.pi * 2.2)
@@ -403,20 +385,19 @@ def render_animated_stamp_drop(
             cur_card = cv2.resize(card_base, (cw, ch), interpolation=cv2.INTER_LINEAR)
             cur_shadow = cv2.resize(shadow_base, (cw + 140, ch + 140), interpolation=cv2.INTER_LINEAR)
         else:
-            # Ambient hovering drift
             drift_t = t - 0.38
-            float_y = 5.0 * math.sin(drift_t * 1.6)
-            float_roll = 0.35 * math.sin(drift_t * 1.2)
+            float_y = 6.0 * math.sin(drift_t * 1.5)
+            float_roll = 0.35 * math.sin(drift_t * 1.1)
             alpha_stamp = 1.0
             cw, ch = target_w, target_h
 
-            # Gentle card transformation
+            # Subtle hovering rotation
             M_card = cv2.getRotationMatrix2D((cw * 0.5, ch * 0.5), float_roll, 1.0)
             cur_card = cv2.warpAffine(card_base, M_card, (cw, ch), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
             cur_shadow = shadow_base
 
-        # Specular sheen sweep between 35% and 75% of scene duration
-        sheen_prog = (t - 0.35 * duration) / max(0.40 * duration, 0.1)
+        # 3. Specular Sheen Sweep
+        sheen_prog = (t - 0.30 * duration) / max(0.40 * duration, 0.1)
         if 0.0 <= sheen_prog <= 1.0:
             cur_card = apply_card_specular_sheen(cur_card, sheen_prog)
 
@@ -424,18 +405,15 @@ def render_animated_stamp_drop(
         x1 = center_x - cw // 2
         y1 = cur_center_y - ch // 2
         sx1 = x1 - 70
-        sy1 = y1 - 50 + int(float_y * 0.5)
+        sy1 = y1 - 48 + int(float_y * 0.5)
 
-        # Composite Drop Shadow & Framed Card
+        # 4. Composite Drop Shadow and Card Over Background
         _fast_roi_blend(bg_frame, cur_shadow, sx1, sy1, alpha_stamp * 0.8)
         _fast_roi_blend(bg_frame, cur_card, x1, y1, alpha_stamp)
 
-        # Composite Headline Banner
+        # 5. Composite Headline Banner on Top with Maximum Saturation
         if banner_np is not None:
             _fast_roi_blend(bg_frame, banner_np, 0, 10, 1.0)
-
-        # Final Vignette Overlay
-        bg_frame = np.clip(bg_frame.astype(np.float32) * vignette, 0, 255).astype(np.uint8)
 
         out.write(bg_frame)
 
