@@ -48,6 +48,7 @@ def render_individual_scene(
 ) -> str:
     """
     Renders any scene into a standardized 1080p 30fps H.264/AAC MP4.
+    Uses multi-threaded ultrafast encoding for fast render completion.
     """
     duration = get_stream_duration(audio_path)
     fade_start, fade_len = calculate_fade_times(duration, 0.4)
@@ -69,7 +70,7 @@ def render_individual_scene(
             "-i", audio_path,
             "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-t", f"{duration:.3f}",
             output_path
@@ -94,7 +95,7 @@ def render_individual_scene(
             "-i", audio_path,
             "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-t", f"{duration:.3f}",
             output_path
@@ -112,7 +113,7 @@ def render_individual_scene(
             "-i", audio_path,
             "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-t", f"{duration:.3f}",
             output_path
