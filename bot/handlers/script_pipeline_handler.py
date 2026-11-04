@@ -12,16 +12,20 @@ from modules.script_parser import process_video_pipeline
 logger = logging.getLogger("VideoEngine.TelegramHandler")
 
 
-def get_bing_cookie() -> str:
-    """Retrieves Bing cookie from Streamlit secrets or environment."""
+def get_bing_cookies():
+    """Extracts all Bing cookies from Streamlit secrets or environment."""
     try:
         import streamlit as st
-        cookie = st.secrets.get("BING_COOKIE_U", "")
-        if cookie and cookie.strip():
-            return cookie.strip()
+        # Support BING_COOKIES list or BING_COOKIE_U string
+        if "BING_COOKIES" in st.secrets:
+            return list(st.secrets["BING_COOKIES"])
+        if "BING_COOKIE_U" in st.secrets:
+            return st.secrets["BING_COOKIE_U"]
     except Exception:
         pass
-    return os.getenv("BING_COOKIE_U", "").strip()
+
+    env_cookies = os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
+    return env_cookies
 
 
 async def safe_edit_message(message: Message, text: str):
@@ -41,7 +45,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
     chat_id = message.chat.id
     status_msg = await message.reply_text("🚀 Pipeline Initialized! Processing script...")
 
-    bing_cookie = get_bing_cookie()
+    bing_cookies = get_bing_cookies()
     output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
     final_output_video = os.path.join(output_dir, f"video_{int(time.time())}.mp4")
@@ -95,7 +99,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
             lambda: process_video_pipeline(
                 script_data=script_data,
                 output_video_path=final_output_video,
-                bing_cookie=bing_cookie,
+                bing_cookie=bing_cookies,
                 progress_callback=progress_callback,
                 artifact_callback=artifact_callback
             )
@@ -114,12 +118,12 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
 
 
 # =====================================================================
-# TELEGRAM MESSAGE HANDLERS
+# COMMAND & MESSAGE HANDLERS
 # =====================================================================
 
 @Client.on_message(filters.command("start") & filters.private)
 async def handle_start_command(client: Client, message: Message):
-    """Answers /start immediately."""
+    """Answers /start immediately so user knows bot is online."""
     await message.reply_text(
         "👋 **Video Engine Bot is Online!**\n\n"
         "Send me a `.json` script file or paste a JSON array directly to generate your video."
@@ -162,7 +166,7 @@ async def handle_json_text(client: Client, message: Message):
         try:
             script_data = json.loads(text)
             if not isinstance(script_data, list):
-                await message.reply_text("❌ JSON root must be an array of scene objects.")
+                await message.reply_text("❌ JSON root must be an array `[...]` of scene objects.")
                 return
             await execute_pipeline_for_user(client, message, script_data)
         except json.JSONDecodeError as err:
