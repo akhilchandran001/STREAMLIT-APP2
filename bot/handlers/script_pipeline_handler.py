@@ -11,12 +11,47 @@ from modules.script_parser import process_video_pipeline
 
 logger = logging.getLogger("VideoEngine.TelegramHandler")
 
+# Full rich onboarding message reflecting the 3-beat rhythm and Mixkit/Wikimedia engine
+START_MESSAGE = (
+    "🎬 **Welcome to the Automated Video Engine Bot!**\n\n"
+    "Send me a `.json` script file or paste your raw JSON text array to trigger video generation.\n\n"
+    "📋 **Scene Rhythm (Strict 3-Beat Cycle):**\n"
+    "• **Beat 1 (Scenes 1, 4, 7...):** Cinematic Landscape Video (Mixkit / Wikimedia Commons)\n"
+    "• **Beat 2 (Scenes 2, 5, 8...):** Looping Background + Stamp-Drop Image + Styled Typography Card\n"
+    "• **Beat 3 (Scenes 3, 6, 9...):** Procedural OpenCV Kinetic Animation (Velocity Ramp, 3D Orbit Freeze, Tape Slam)\n"
+    "• **Every Scene:** Standardized 1080p 30fps with 0.4s smooth fade transitions\n"
+    "• **Real-Time Delivery:** Each TTS audio, generated image, and scene MP4 is uploaded directly to your chat as it completes.\n\n"
+    "📝 **Expected JSON Schema:**\n"
+    "```json\n"
+    "[\n"
+    "  {\n"
+    "    \"sentence\": \"നമസ്കാരം, ഇത് ആദ്യത്തെ രംഗമാണ്.\",\n"
+    "    \"query\": \"futuristic technology nature\"\n"
+    "  },\n"
+    "  {\n"
+    "    \"sentence\": \"രണ്ടാമത്തെ രംഗത്തിൽ ഇമേജ് പശ്ചാത്തലത്തിൽ വരുന്നു.\",\n"
+    "    \"prompt\": \"ancient temple carved into floating mountain in clouds\",\n"
+    "    \"image_source\": \"auto\",\n"
+    "    \"headline\": {\n"
+    "      \"prefix\": \"Ancient\",\n"
+    "      \"highlight\": \"Temple\",\n"
+    "      \"suffix\": \"Mysteries\"\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"sentence\": \"മൂന്നാമത്തെ രംഗത്തിൽ അനിമേഷൻ വരുന്നു.\",\n"
+    "    \"prompt\": \"cybernetic neon vortex kinetic energy explosion, 8k\",\n"
+    "    \"source\": \"bing\"\n"
+    "  }\n"
+    "]\n"
+    "```"
+)
+
 
 def get_bing_cookies():
     """Extracts all Bing cookies from Streamlit secrets or environment."""
     try:
         import streamlit as st
-        # Support BING_COOKIES list or BING_COOKIE_U string
         if "BING_COOKIES" in st.secrets:
             return list(st.secrets["BING_COOKIES"])
         if "BING_COOKIE_U" in st.secrets:
@@ -123,11 +158,8 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
 
 @Client.on_message(filters.command("start") & filters.private)
 async def handle_start_command(client: Client, message: Message):
-    """Answers /start immediately so user knows bot is online."""
-    await message.reply_text(
-        "👋 **Video Engine Bot is Online!**\n\n"
-        "Send me a `.json` script file or paste a JSON array directly to generate your video."
-    )
+    """Responds to /start with the full engine guide and schema documentation."""
+    await message.reply_text(START_MESSAGE, disable_web_page_preview=True)
 
 
 @Client.on_message(filters.document & filters.private)
@@ -174,5 +206,5 @@ async def handle_json_text(client: Client, message: Message):
     else:
         await message.reply_text(
             "⚠️ Please send a valid JSON script array (starting with `[` and ending with `]`) "
-            "or upload a `.json` file."
+            "or upload a `.json` file.\n\nSend /start to view the expected format and schema."
         )
