@@ -7,3 +7,4 @@ requests
 numpy
 opencv-python-headless
 bingart
+matplotlib
