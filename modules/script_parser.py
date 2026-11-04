@@ -42,9 +42,13 @@ ABSTRACT_AI_KEYWORDS = {
 }
 
 
-def _execute_tts(sentence: str, target_audio_path: str) -> tuple[str, float]:
+def _execute_tts(sentence: str, target_audio_path: str, voice_name: str = None) -> tuple[str, float]:
     """Safely executes generate_speech whether it is an async coroutine or sync function."""
-    res = generate_speech(sentence, target_audio_path)
+    kwargs = {}
+    if voice_name:
+        kwargs["voice_name"] = voice_name
+
+    res = generate_speech(sentence, target_audio_path, **kwargs)
 
     if inspect.iscoroutine(res):
         try:
@@ -133,13 +137,22 @@ def get_available_backgrounds(assets_dir: str = BG_DIR) -> list[str]:
 
 def process_video_pipeline(
     script_data: list[dict],
-    output_video_path: str,
+    output_video_path: str = None,
     temp_dir: str = "temp_pipeline",
     bing_cookie=None,
+    bing_cookie_u=None,
+    voice_name: str = None,
     progress_callback=None,
     artifact_callback=None
 ) -> str:
     start_time = time.time()
+    effective_cookie = bing_cookie or bing_cookie_u
+
+    if not output_video_path:
+        output_video_path = os.path.join(OUTPUT_DIR, f"master_video_{int(start_time)}.mp4")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_video_path)), exist_ok=True)
+
     run_temp_dir = os.path.join(temp_dir, f"run_{int(start_time)}")
     os.makedirs(run_temp_dir, exist_ok=True)
 
@@ -162,7 +175,7 @@ def process_video_pipeline(
             sentence = scene.get("sentence", "").strip()
             query_text = scene.get("query", "").strip()
             prompt_text = scene.get("prompt", "").strip()
-            headline_data = scene.get("headline", None)
+            headline_data = scene.get("headline") or scene.get("heading") or scene.get("title", None)
 
             if not sentence:
                 continue
@@ -173,7 +186,7 @@ def process_video_pipeline(
                 progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
 
             audio_target = os.path.join(run_temp_dir, f"{scene_prefix}_tts.wav")
-            audio_path, duration = _execute_tts(sentence, audio_target)
+            audio_path, duration = _execute_tts(sentence, audio_target, voice_name=voice_name)
 
             if artifact_callback:
                 artifact_callback("audio", audio_path, f"🎤 Scene {scene_num} Audio ({duration:.1f}s)")
@@ -205,7 +218,7 @@ def process_video_pipeline(
                     progress_callback(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp...")
 
                 raw_img_path = os.path.join(run_temp_dir, f"{scene_prefix}_image.jpg")
-                acquire_scene_image(scene, raw_img_path, bing_cookie)
+                acquire_scene_image(scene, raw_img_path, effective_cookie)
 
                 if artifact_callback and os.path.exists(raw_img_path):
                     artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image")
@@ -232,7 +245,7 @@ def process_video_pipeline(
                 acquired = False
                 if prompt_text:
                     try:
-                        run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookie)
+                        run_sync_generate(prompt_text, raw_img_path, cookie_u=effective_cookie)
                         acquired = os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 1000
                     except Exception as e:
                         logger.warning(f"Bing AI failed for Type 3 ({e}). Trying Wikimedia fallback...")
@@ -248,10 +261,11 @@ def process_video_pipeline(
 
                 anim_video_path = os.path.join(run_temp_dir, f"{scene_prefix}_animation.mp4")
                 render_animation_by_index(
-                    index=anim_cycle_idx,
                     image_path=raw_img_path,
                     output_path=anim_video_path,
-                    duration=duration
+                    duration_sec=duration,
+                    cycle_index=anim_cycle_idx,
+                    fps=30
                 )
                 anim_cycle_idx += 1
 
