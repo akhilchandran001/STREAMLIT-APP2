@@ -45,18 +45,31 @@ ANIMATION_REGISTRY = [
 
 
 def render_animation_by_index(
-    image_path: str,
-    output_path: str,
-    duration_sec: float,
+    image_path: str = None,
+    output_path: str = None,
+    duration_sec: float = None,
     cycle_index: int = 0,
-    fps: int = 30
+    fps: int = 30,
+    *,
+    index: int = None,
+    duration: float = None,
+    **kwargs
 ) -> str:
     """
     Rounds through the 6 animations sequentially based on the cycle counter,
     ensuring each animated sentence receives a fresh, non-repeating procedural style
     calibrated to the exact duration of the TTS audio.
+    Accepts both (cycle_index, duration_sec) and (index, duration) to prevent keyword argument errors.
     """
-    if not os.path.exists(image_path):
+    if index is not None:
+        cycle_index = index
+    if duration is not None:
+        duration_sec = duration
+
+    if duration_sec is None:
+        duration_sec = 6.0
+
+    if not image_path or not os.path.exists(image_path):
         raise FileNotFoundError(f"Input image not found at '{image_path}'")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -100,10 +113,22 @@ def render_animation_by_name(
 
     for idx, spec in enumerate(ANIMATION_REGISTRY):
         if spec["id"] == normalized_id or spec["name"].lower() == normalized_id:
-            return render_animation_by_index(image_path, output_path, duration_sec, cycle_index=idx, fps=fps)
+            return render_animation_by_index(
+                image_path=image_path,
+                output_path=output_path,
+                duration_sec=duration_sec,
+                cycle_index=idx,
+                fps=fps
+            )
 
     print(f"[Animation Router] Unknown animation ID '{animation_id}', defaulting to cycle index 0.")
-    return render_animation_by_index(image_path, output_path, duration_sec, cycle_index=0, fps=fps)
+    return render_animation_by_index(
+        image_path=image_path,
+        output_path=output_path,
+        duration_sec=duration_sec,
+        cycle_index=0,
+        fps=fps
+    )
 
 
 if __name__ == "__main__":
@@ -112,4 +137,9 @@ if __name__ == "__main__":
     test_dur = float(sys.argv[3]) if len(sys.argv) > 3 else 6.5
     test_idx = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
-    render_animation_by_index(test_img, test_out, test_dur, cycle_index=test_idx)
+    render_animation_by_index(
+        image_path=test_img,
+        output_path=test_out,
+        duration_sec=test_dur,
+        cycle_index=test_idx
+    )
