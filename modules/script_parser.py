@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import time
 
@@ -61,6 +62,18 @@ def is_valid_media_file(file_path: str, min_size_bytes: int = 15000) -> bool:
     return os.path.exists(file_path) and os.path.getsize(file_path) >= min_size_bytes
 
 
+def sanitize_mathtext(expr: str) -> str:
+    """Replaces unsupported LaTeX macros with valid mathtext equivalents."""
+    cleaned = expr.strip()
+    # Replace \stackrel{?}{=} with \approx
+    cleaned = re.sub(r'\\stackrel\{[^}]*\}\{=\}', r'\\approx', cleaned)
+    # Replace \implies with \Rightarrow
+    cleaned = cleaned.replace(r'\implies', r'\Rightarrow')
+    # Replace \iff with \Leftrightarrow
+    cleaned = cleaned.replace(r'\iff', r'\Leftrightarrow')
+    return cleaned
+
+
 def render_cinematic_equation_card(
     latex_equation: str,
     output_path: str,
@@ -70,41 +83,64 @@ def render_cinematic_equation_card(
 ) -> str:
     """
     Renders an exact LaTeX formula onto a dark obsidian cinematic card.
-    Uses Matplotlib's native Computer Modern mathtext parser.
+    Guaranteed zero-crash with multi-stage fallback.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    clean_expr = latex_equation.strip()
+    clean_expr = sanitize_mathtext(latex_equation)
     if not clean_expr.startswith("$"):
         clean_expr = f"${clean_expr}$"
 
-    fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="none")
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.axis("off")
-    ax.patch.set_alpha(0.0)
+    # Multi-stage rendering with bulletproof try/except
+    fig = None
+    rendered_successfully = False
 
-    # Main formula text
-    ax.text(
-        0.5, 0.50, clean_expr,
-        fontsize=48,
-        color="#FFFFFF",
-        ha="center", va="center",
-        usetex=False
-    )
+    for attempt in range(2):
+        try:
+            fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="none")
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.axis("off")
+            ax.patch.set_alpha(0.0)
 
-    # Optional formula label
-    if formula_name:
-        ax.text(
-            0.5, 0.18, formula_name.upper(),
-            fontsize=22,
-            color="#DC2644",
-            fontweight="bold",
-            ha="center", va="center"
-        )
+            # Stage 1: Try rendering math formula
+            current_text = clean_expr if attempt == 0 else clean_expr.replace('\\', '')
+            is_math = attempt == 0
 
-    fig.canvas.draw()
-    rgba_buffer = np.asarray(fig.canvas.buffer_rgba())
-    plt.close(fig)
+            ax.text(
+                0.5, 0.50, current_text,
+                fontsize=46 if is_math else 34,
+                color="#FFFFFF",
+                ha="center", va="center",
+                usetex=False
+            )
+
+            if formula_name:
+                ax.text(
+                    0.5, 0.18, formula_name.upper(),
+                    fontsize=22,
+                    color="#DC2644",
+                    fontweight="bold",
+                    ha="center", va="center"
+                )
+
+            fig.canvas.draw()
+            rgba_buffer = np.asarray(fig.canvas.buffer_rgba())
+            plt.close(fig)
+            rendered_successfully = True
+            break
+        except Exception as err:
+            logger.warning(f"[EquationRenderer] Mathtext warning on attempt {attempt + 1}: {err}")
+            if fig is not None:
+                plt.close(fig)
+
+    # Stage 3 fallback: If matplotlib failed completely, draw clean fallback image
+    if not rendered_successfully:
+        logger.warning(f"[EquationRenderer] Fallback to clean title card for: {formula_name}")
+        fallback_img = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.putText(fallback_img, formula_name or "MATHEMATICAL FORMULA", (width // 4, height // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.imwrite(output_path, fallback_img)
+        return output_path
 
     formula_bgr = cv2.cvtColor(rgba_buffer, cv2.COLOR_RGBA2BGR)
     formula_alpha = rgba_buffer[:, :, 3] / 255.0
@@ -186,7 +222,6 @@ def generate_emergency_fallback_image(output_path: str):
 
 def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
     """Acquires image using intelligent routing with complete two-way fallback."""
-    # Priority 0: Exact Equation Card Bypass
     if "equation" in scene and str(scene.get("equation", "")).strip():
         logger.info(f"[ImageAcquisition] Equation detected. Rendering local math card...")
         formula_latex = str(scene["equation"]).strip()
@@ -257,14 +292,6 @@ def process_video_pipeline(
     progress_callback=None,
     artifact_callback=None
 ) -> str:
-    """
-    Executes the video pipeline with:
-    - Resumable scene caching (skips completed work).
-    - Multi-cookie Bing rotation.
-    - Zero-crash background video fallback.
-    - Native LaTeX equation card rendering.
-    - Cooldown intervals between scenes.
-    """
     start_time = time.time()
     effective_cookie = bing_cookie or bing_cookie_u
 
@@ -289,10 +316,9 @@ def process_video_pipeline(
         scene_prefix = f"scene_{scene_num:02d}"
         s_hash = compute_scene_hash(scene)
 
-        # Persistent Checkpoint Cache Path
         cached_scene_mp4 = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_rendered.mp4")
 
-        # STEP 0: Checkpoint Hit Check (Instant Resume)
+        # Instant Cache Skip
         if is_valid_media_file(cached_scene_mp4, 50000):
             logger.info(f"[{scene_prefix}] Found cached completed render. Reusing...")
             if progress_callback:
@@ -327,9 +353,7 @@ def process_video_pipeline(
         scene_mode = idx % 3
         rendered_scene_mp4 = cached_scene_mp4
 
-        # -----------------------------------------------------------------
-        # MODE 0: LANDSCAPE B-ROLL VIDEO (Zero-Crash Fallback)
-        # -----------------------------------------------------------------
+        # MODE 0: LANDSCAPE B-ROLL VIDEO
         if scene_mode == 0:
             logger.info(f"[{scene_prefix}] Rendering Landscape Video")
             if progress_callback:
@@ -353,9 +377,7 @@ def process_video_pipeline(
                 video_path=raw_video_path
             )
 
-        # -----------------------------------------------------------------
-        # MODE 1: BACKGROUND LOOP + STAMP CARD (IMAGE OR FORMULA)
-        # -----------------------------------------------------------------
+        # MODE 1: BACKGROUND LOOP + STAMP CARD
         elif scene_mode == 1:
             logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
             if progress_callback:
@@ -380,9 +402,7 @@ def process_video_pipeline(
                 headline_data=headline_data
             )
 
-        # -----------------------------------------------------------------
-        # MODE 2: KINETIC ANIMATION (IMAGE OR FORMULA)
-        # -----------------------------------------------------------------
+        # MODE 2: KINETIC ANIMATION
         elif scene_mode == 2:
             logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
             if progress_callback:
@@ -390,7 +410,6 @@ def process_video_pipeline(
 
             raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_ai_image.jpg")
             if not is_valid_media_file(raw_img_path, 5000):
-                # Check for equation in Mode 2
                 if "equation" in scene and str(scene.get("equation", "")).strip():
                     formula_latex = str(scene["equation"]).strip()
                     formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
@@ -435,7 +454,7 @@ def process_video_pipeline(
 
         scene_video_paths.append(rendered_scene_mp4)
 
-        # Rest / Cooldown Heartbeat between scenes
+        # Rest Cooldown Heartbeat between scenes
         if scene_num < total_scenes and rest_seconds_between_scenes > 0:
             logger.info(f"Resting for {rest_seconds_between_scenes}s to cool down CPU and Bing cookie...")
             for remaining in range(rest_seconds_between_scenes, 0, -5):
