@@ -57,19 +57,35 @@ def compute_scene_hash(scene: dict) -> str:
     return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
 
 
-def is_valid_media_file(file_path: str, min_size_bytes: int = 15000) -> bool:
+def is_valid_media_file(file_path: str, min_size_bytes: int = 5000) -> bool:
     """Checks if a file exists, is non-empty, and has valid media content."""
     return os.path.exists(file_path) and os.path.getsize(file_path) >= min_size_bytes
+
+
+def is_valid_video_file(file_path: str, min_size_bytes: int = 20000) -> bool:
+    """
+    Verifies that a video file is completely written and playable.
+    Detects truncated / incomplete MP4s (e.g. missing moov atom) and deletes them.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < min_size_bytes:
+        return False
+    try:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return bool(ret and frame is not None and frame.size > 0)
+    except Exception:
+        return False
 
 
 def sanitize_mathtext(expr: str) -> str:
     """Replaces unsupported LaTeX macros with valid mathtext equivalents."""
     cleaned = expr.strip()
-    # Replace \stackrel{?}{=} with \approx
     cleaned = re.sub(r'\\stackrel\{[^}]*\}\{=\}', r'\\approx', cleaned)
-    # Replace \implies with \Rightarrow
     cleaned = cleaned.replace(r'\implies', r'\Rightarrow')
-    # Replace \iff with \Leftrightarrow
     cleaned = cleaned.replace(r'\iff', r'\Leftrightarrow')
     return cleaned
 
@@ -91,7 +107,6 @@ def render_cinematic_equation_card(
     if not clean_expr.startswith("$"):
         clean_expr = f"${clean_expr}$"
 
-    # Multi-stage rendering with bulletproof try/except
     fig = None
     rendered_successfully = False
 
@@ -102,7 +117,6 @@ def render_cinematic_equation_card(
             ax.axis("off")
             ax.patch.set_alpha(0.0)
 
-            # Stage 1: Try rendering math formula
             current_text = clean_expr if attempt == 0 else clean_expr.replace('\\', '')
             is_math = attempt == 0
 
@@ -133,9 +147,7 @@ def render_cinematic_equation_card(
             if fig is not None:
                 plt.close(fig)
 
-    # Stage 3 fallback: If matplotlib failed completely, draw clean fallback image
     if not rendered_successfully:
-        logger.warning(f"[EquationRenderer] Fallback to clean title card for: {formula_name}")
         fallback_img = np.zeros((height, width, 3), dtype=np.uint8)
         cv2.putText(fallback_img, formula_name or "MATHEMATICAL FORMULA", (width // 4, height // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 3, cv2.LINE_AA)
@@ -145,7 +157,6 @@ def render_cinematic_equation_card(
     formula_bgr = cv2.cvtColor(rgba_buffer, cv2.COLOR_RGBA2BGR)
     formula_alpha = rgba_buffer[:, :, 3] / 255.0
 
-    # Build dark obsidian background with radial gradient
     y_coords, x_coords = np.mgrid[0:height, 0:width].astype(np.float32)
     cx, cy = width * 0.5, height * 0.5
     r = np.sqrt((x_coords - cx) ** 2 + (y_coords - cy) ** 2) / np.sqrt(cx ** 2 + cy ** 2)
@@ -155,11 +166,9 @@ def render_cinematic_equation_card(
     ambient_tone = np.array([10, 8, 8], dtype=np.float32)
     card_surface = (ambient_tone + (dark_tone - ambient_tone) * gradient).astype(np.uint8)
 
-    # Gridlines for scientific aesthetic
     card_surface[::60, :, :] = np.clip(card_surface[::60, :, :].astype(np.int16) + 12, 0, 255).astype(np.uint8)
     card_surface[:, ::60, :] = np.clip(card_surface[:, ::60, :].astype(np.int16) + 12, 0, 255).astype(np.uint8)
 
-    # Composite formula with subtle glow
     alpha_3ch = formula_alpha[:, :, np.newaxis]
     final_card = (card_surface * (1.0 - alpha_3ch) + formula_bgr * alpha_3ch).astype(np.uint8)
 
@@ -318,15 +327,24 @@ def process_video_pipeline(
 
         cached_scene_mp4 = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_rendered.mp4")
 
-        # Instant Cache Skip
-        if is_valid_media_file(cached_scene_mp4, 50000):
-            logger.info(f"[{scene_prefix}] Found cached completed render. Reusing...")
+        # -------------------------------------------------------------
+        # 1. CHECKPOINT VERIFICATION (Ensures MP4 is uncorrupted)
+        # -------------------------------------------------------------
+        if is_valid_video_file(cached_scene_mp4, 50000):
+            logger.info(f"[{scene_prefix}] Found valid cached render. Reusing...")
             if progress_callback:
                 progress_callback(f"Scene {scene_num}/{total_scenes}: Reusing completed cache...")
             if artifact_callback:
                 artifact_callback("video", cached_scene_mp4, f"🎬 Scene {scene_num} (Cached)")
             scene_video_paths.append(cached_scene_mp4)
             continue
+        elif os.path.exists(cached_scene_mp4):
+            # Broken/truncated MP4 from an interrupted run: purge it
+            logger.warning(f"[{scene_prefix}] Removing corrupted/incomplete render cache...")
+            try:
+                os.remove(cached_scene_mp4)
+            except Exception:
+                pass
 
         sentence = scene.get("sentence", "").strip()
         query_text = scene.get("query", "").strip()
@@ -336,7 +354,9 @@ def process_video_pipeline(
         if not sentence:
             continue
 
-        # 1. Voiceover
+        # -------------------------------------------------------------
+        # 2. VOICEOVER GENERATION
+        # -------------------------------------------------------------
         logger.info(f"[{scene_prefix}] Generating Voiceover...")
         if progress_callback:
             progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
@@ -353,7 +373,9 @@ def process_video_pipeline(
         scene_mode = idx % 3
         rendered_scene_mp4 = cached_scene_mp4
 
-        # MODE 0: LANDSCAPE B-ROLL VIDEO
+        # -------------------------------------------------------------
+        # MODE 0: LANDSCAPE B-ROLL VIDEO (Bulletproof with Zero Crash)
+        # -------------------------------------------------------------
         if scene_mode == 0:
             logger.info(f"[{scene_prefix}] Rendering Landscape Video")
             if progress_callback:
@@ -362,22 +384,45 @@ def process_video_pipeline(
             video_search_query = query_text or prompt_text or "space"
             raw_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_raw_video.mp4")
 
-            if not is_valid_media_file(raw_video_path, 20000):
+            # Check if existing raw video is valid. If corrupt, remove it immediately.
+            if not is_valid_video_file(raw_video_path, 20000):
+                if os.path.exists(raw_video_path):
+                    try:
+                        os.remove(raw_video_path)
+                    except Exception:
+                        pass
                 try:
                     fetch_landscape_video(video_search_query, raw_video_path)
                 except Exception as e:
                     logger.warning(f"[{scene_prefix}] Stock video fetch failed ({e}). Using local background fallback...")
+
+                # If download failed or file is still corrupted, use clean local background
+                if not is_valid_video_file(raw_video_path, 20000):
                     fallback_bg = available_bgs[bg_cycle_idx % len(available_bgs)]
                     shutil.copyfile(fallback_bg, raw_video_path)
 
-            render_individual_scene(
-                scene_type="video",
-                audio_path=audio_path,
-                output_path=rendered_scene_mp4,
-                video_path=raw_video_path
-            )
+            # Render scene with automatic recovery fallback
+            try:
+                render_individual_scene(
+                    scene_type="video",
+                    audio_path=audio_path,
+                    output_path=rendered_scene_mp4,
+                    video_path=raw_video_path
+                )
+            except Exception as render_err:
+                logger.warning(f"[{scene_prefix}] Render failed with raw video ({render_err}). Forcing clean fallback...")
+                fallback_bg = available_bgs[bg_cycle_idx % len(available_bgs)]
+                shutil.copyfile(fallback_bg, raw_video_path)
+                render_individual_scene(
+                    scene_type="video",
+                    audio_path=audio_path,
+                    output_path=rendered_scene_mp4,
+                    video_path=raw_video_path
+                )
 
+        # -------------------------------------------------------------
         # MODE 1: BACKGROUND LOOP + STAMP CARD
+        # -------------------------------------------------------------
         elif scene_mode == 1:
             logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
             if progress_callback:
@@ -402,7 +447,9 @@ def process_video_pipeline(
                 headline_data=headline_data
             )
 
+        # -------------------------------------------------------------
         # MODE 2: KINETIC ANIMATION
+        # -------------------------------------------------------------
         elif scene_mode == 2:
             logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
             if progress_callback:
@@ -449,7 +496,7 @@ def process_video_pipeline(
                 animation_video_path=anim_video_path
             )
 
-        if artifact_callback and is_valid_media_file(rendered_scene_mp4):
+        if artifact_callback and is_valid_video_file(rendered_scene_mp4, 20000):
             artifact_callback("video", rendered_scene_mp4, f"🎬 Scene {scene_num} Rendered MP4")
 
         scene_video_paths.append(rendered_scene_mp4)
@@ -468,7 +515,7 @@ def process_video_pipeline(
 
     concat_all_scenes(scene_video_paths, output_video_path)
 
-    if artifact_callback and is_valid_media_file(output_video_path):
+    if artifact_callback and is_valid_video_file(output_video_path, 50000):
         artifact_callback("final_video", output_video_path, "🏆 Final Full Combined Video")
 
     logger.info(f"Pipeline finished in {time.time() - start_time:.2f}s -> {output_video_path}")
