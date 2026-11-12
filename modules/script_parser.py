@@ -314,11 +314,12 @@ def process_video_pipeline(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_video_path)), exist_ok=True)
 
+    # Background files required ONLY in Default Mode
     available_bgs = []
     if pipeline_mode == "default":
         available_bgs = get_available_backgrounds(BG_DIR)
         if not available_bgs:
-            raise RuntimeError(f"No background videos found in '{BG_DIR}/'.")
+            raise RuntimeError(f"No background videos found in '{BG_DIR}/'. Upload .mp4 backgrounds or switch to Whiteboard Mode.")
 
     scene_video_paths = []
     bg_cycle_idx = 0
@@ -326,6 +327,19 @@ def process_video_pipeline(
     total_scenes = len(script_data)
 
     logger.info(f"Pipeline started for {total_scenes} scenes in [{pipeline_mode.upper()}] mode.")
+
+    def notify_progress(msg: str):
+        """Universal progress dispatcher that never crashes on argument variations."""
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except TypeError:
+                try:
+                    progress_callback(idx + 1, total_scenes, msg)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     for idx, scene in enumerate(script_data):
         scene_num = idx + 1
@@ -339,15 +353,12 @@ def process_video_pipeline(
         # -------------------------------------------------------------
         if is_valid_video_file(cached_scene_mp4, 50000):
             logger.info(f"[{scene_prefix}] Found valid cached render. Reusing...")
-            if progress_callback:
-                progress_callback(f"Scene {scene_num}/{total_scenes}: Reusing completed cache...")
+            notify_progress(f"Scene {scene_num}/{total_scenes}: Reusing completed cache...")
             if artifact_callback:
                 artifact_callback("video", cached_scene_mp4, f"🎬 Scene {scene_num} (Cached)")
             scene_video_paths.append(cached_scene_mp4)
             continue
         elif os.path.exists(cached_scene_mp4):
-            # Broken/truncated MP4 from an interrupted run: purge it
-            logger.warning(f"[{scene_prefix}] Removing corrupted/incomplete render cache...")
             try:
                 os.remove(cached_scene_mp4)
             except Exception:
@@ -362,11 +373,10 @@ def process_video_pipeline(
             continue
 
         # -------------------------------------------------------------
-        # 2. VOICEOVER GENERATION (Duration drives visual timeline)
+        # 2. VOICEOVER GENERATION (Exact duration drives visual clock)
         # -------------------------------------------------------------
         logger.info(f"[{scene_prefix}] Generating Voiceover...")
-        if progress_callback:
-            progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
+        notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
 
         audio_target = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_tts.wav")
         if not is_valid_media_file(audio_target, 5000):
@@ -389,8 +399,7 @@ def process_video_pipeline(
             is_text_block = scene.get("type") in ["math", "heading", "blocks"]
 
             if has_eq or is_text_block:
-                if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Hand-Drawing Math & Equations ({duration:.1f}s)...")
+                notify_progress(f"Scene {scene_num}/{total_scenes}: Hand-Drawing Math & Equations ({duration:.1f}s)...")
 
                 blocks = []
                 title = str(scene.get("formula_name") or scene.get("title") or "").strip()
@@ -411,8 +420,7 @@ def process_video_pipeline(
                     fps=30
                 )
             else:
-                if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Line Art & Hand-Sketching ({duration:.1f}s)...")
+                notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Line Art & Hand-Sketching ({duration:.1f}s)...")
 
                 wb_prompt = prompt_text or f"clean black and white line art vector sketch of {query_text}, pure white background, coloring book style"
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_wb_image.jpg")
@@ -442,7 +450,7 @@ def process_video_pipeline(
                     fps=30
                 )
 
-            # Mux Whiteboard video with Cartesia audio and standard 0.4s fade
+            # Mux Whiteboard video with Cartesia audio and smooth 0.4s fade
             render_individual_scene(
                 scene_type="animation",
                 audio_path=audio_path,
@@ -459,8 +467,7 @@ def process_video_pipeline(
             # MODE 0: LANDSCAPE B-ROLL VIDEO
             if scene_mode == 0:
                 logger.info(f"[{scene_prefix}] Rendering Landscape Video")
-                if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Fetching Video Footage...")
+                notify_progress(f"Scene {scene_num}/{total_scenes}: Fetching Video Footage...")
 
                 video_search_query = query_text or prompt_text or "space"
                 raw_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_raw_video.mp4")
@@ -500,8 +507,7 @@ def process_video_pipeline(
             # MODE 1: BACKGROUND LOOP + STAMP CARD
             elif scene_mode == 1:
                 logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
-                if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp...")
+                notify_progress(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp...")
 
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_image.jpg")
                 if not is_valid_media_file(raw_img_path, 5000):
@@ -525,8 +531,7 @@ def process_video_pipeline(
             # MODE 2: KINETIC ANIMATION
             elif scene_mode == 2:
                 logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
-                if progress_callback:
-                    progress_callback(f"Scene {scene_num}/{total_scenes}: Generating Visual & Animation...")
+                notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Visual & Animation...")
 
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_ai_image.jpg")
                 if not is_valid_media_file(raw_img_path, 5000):
@@ -578,13 +583,11 @@ def process_video_pipeline(
         if scene_num < total_scenes and rest_seconds_between_scenes > 0:
             logger.info(f"Resting for {rest_seconds_between_scenes}s...")
             for remaining in range(rest_seconds_between_scenes, 0, -5):
-                if progress_callback:
-                    progress_callback(f"⏳ Cooldown: Resting CPU & Cookies for {remaining}s...")
+                notify_progress(f"⏳ Cooldown: Resting for {remaining}s...")
                 time.sleep(min(5, remaining))
 
     logger.info(f"Concatenating {len(scene_video_paths)} scenes...")
-    if progress_callback:
-        progress_callback("Concatenating all scenes into master video...")
+    notify_progress("Concatenating all scenes into master video...")
 
     concat_all_scenes(scene_video_paths, output_video_path)
 
