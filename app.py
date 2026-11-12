@@ -9,6 +9,7 @@ import streamlit as st
 from bot.bot_runner import start_bot, stop_bot, is_bot_active
 from modules.cartesia_tts import VOICE_LIST, DEFAULT_VOICE_NAME
 from modules.script_parser import process_video_pipeline, get_available_backgrounds, BG_DIR, OUTPUT_DIR
+from modules.text_parser import parse_input_script
 from animations.animation_router import ANIMATION_REGISTRY
 
 # Page configuration
@@ -93,7 +94,7 @@ with st.sidebar:
     st.divider()
 
     # Background Video Assets Management
-    st.subheader("🎞️ Canvas Backgrounds")
+    st.subheader("🎞️ Canvas Backgrounds (Default Mode)")
     available_bgs = get_available_backgrounds()
     st.write(f"Loaded: `{len(available_bgs)}` video loops")
 
@@ -115,83 +116,105 @@ with st.sidebar:
 # MAIN DASHBOARD INTERFACE
 # -------------------------------------------------------------
 st.title("🎬 Multi-Scene Automated Video Engine")
-st.caption("Synchronized Cartesia TTS • Pixabay Footage • Bing AI Graphics • Procedural OpenCV Animations")
+st.caption("Synchronized Cartesia TTS • Whiteboard Living Hand Drawing • Bing AI Graphics • Procedural Kinetic Animations")
 
-tabs = st.tabs(["🚀 Run Pipeline", "📋 Script Schema & Sample", "🎨 Registered Animations & Backgrounds"])
+tabs = st.tabs(["🚀 Run Pipeline", "📋 Script Schema & Sample", "🎨 Registered Engines"])
 
 # -------------------------------------------------------------
 # TAB 1: RUN PIPELINE
 # -------------------------------------------------------------
 with tabs[0]:
-    input_method = st.radio("Input Source", ["Paste JSON Script", "Upload .json File"], horizontal=True)
+    col_mode, col_src = st.columns([1, 1])
+
+    with col_mode:
+        selected_mode_label = st.radio(
+            "🎬 Pipeline Rendering Mode",
+            ["🎬 Default (3-Beat Video/Stamp/Animation)", "✍️ Whiteboard (Living Hand Drawing & Math)"],
+            index=0
+        )
+        pipeline_mode = "whiteboard" if "Whiteboard" in selected_mode_label else "default"
+
+    with col_src:
+        input_method = st.radio(
+            "Input Source",
+            ["Paste Script (.json / .txt)", "Upload File (.json / .txt)"],
+            horizontal=True
+        )
+
     raw_script_content = ""
 
-    if input_method == "Paste JSON Script":
-        sample_json_default = json.dumps([
-            {
-                "sentence": "നമസ്കാരം, ഇത് ആധുനിക വീഡിയോ നിർമ്മാണ സംവിധാനത്തിന്റെ ആദ്യ രംഗമാണ്.",
-                "query": "cinematic technology abstract landscape"
-            },
-            {
-                "sentence": "രണ്ടാമത്തെ രംഗത്തിൽ പശ്ചാത്തല വീഡിയോയുടെ മുകളിൽ ഇമേജ് കൃത്യമായ അനുപാതത്തിൽ വരുന്നു.",
-                "prompt": "futuristic neon glass citadel floating in sunset clouds",
-                "source": "bing"
-            },
-            {
-                "sentence": "മൂന്നാമത്തെ രംഗത്തിൽ ചലനാത്മകമായ അനിമേഷൻ സംവിധാനം പ്രവർത്തിക്കുന്നു.",
-                "query": "cyberpunk digital matrix hologram",
-                "source": "pixabay"
-            }
-        ], ensure_ascii=False, indent=2)
+    if input_method == "Paste Script (.json / .txt)":
+        if pipeline_mode == "whiteboard":
+            sample_content_default = (
+                "നമസ്കാരം, ഇത് വൈറ്റ്ബോർഡ് ആനിമേഷൻ സംവിധാനത്തിന്റെ ആദ്യ രംഗമാണ്. | futuristic robot science\n"
+                "ഷ്രോഡിംഗർ സമവാക്യം ക്വാണ്ടം ഭൗതികത്തിലെ അടിസ്ഥാന സമവാക്യമാണ്. | i\\hbar \\frac{\\partial}{\\partial t}\\Psi = \\hat{H}\\Psi | Schrodinger Equation\n"
+                "മൂന്നാമത്തെ രംഗത്തിൽ ശാസ്ത്ര ചിത്രം കൃത്യമായി വരയ്ക്കുന്നു. | molecular crystal structure"
+            )
+        else:
+            sample_content_default = json.dumps([
+                {
+                    "sentence": "നമസ്കാരം, ഇത് ആധുനിക വീഡിയോ നിർമ്മാണ സംവിധാനത്തിന്റെ ആദ്യ രംഗമാണ്.",
+                    "query": "cinematic technology abstract landscape"
+                },
+                {
+                    "sentence": "രണ്ടാമത്തെ രംഗത്തിൽ പശ്ചാത്തല വീഡിയോയുടെ മുകളിൽ ഇമേജ് കൃത്യമായ അനുപാതത്തിൽ വരുന്നു.",
+                    "prompt": "futuristic neon glass citadel floating in sunset clouds",
+                    "source": "bing"
+                },
+                {
+                    "sentence": "മൂന്നാമത്തെ രംഗത്തിൽ ചലനാത്മകമായ അനിമേഷൻ സംവിധാനം പ്രവർത്തിക്കുന്നു.",
+                    "query": "cyberpunk digital matrix hologram",
+                    "source": "pixabay"
+                }
+            ], ensure_ascii=False, indent=2)
 
         raw_script_content = st.text_area(
-            "Script JSON Payload",
-            value=sample_json_default,
+            "Script Content (JSON Array or Plain Text Lines)",
+            value=sample_content_default,
             height=260
         )
     else:
-        uploaded_json = st.file_uploader("Upload JSON Script", type=["json"])
-        if uploaded_json:
-            raw_script_content = uploaded_json.read().decode("utf-8")
+        uploaded_file = st.file_uploader("Upload Script File", type=["json", "txt"])
+        if uploaded_file:
+            raw_script_content = uploaded_file.read().decode("utf-8", errors="ignore")
 
     start_render = st.button("🚀 Render Master Video", type="primary", use_container_width=True)
 
     if start_render:
         if not raw_script_content.strip():
-            st.error("Please supply a valid JSON script payload.")
+            st.error("Please supply a valid script payload.")
         else:
             try:
-                parsed_script = json.loads(raw_script_content)
+                parsed_script = parse_input_script(raw_script_content)
                 if not isinstance(parsed_script, list) or len(parsed_script) == 0:
-                    st.error("JSON payload must be a non-empty array of scene objects.")
+                    st.error("Failed to extract any scenes from the input.")
                     st.stop()
-            except json.JSONDecodeError as err:
-                st.error(f"Invalid JSON Syntax: {err}")
+            except Exception as err:
+                st.error(f"Invalid Script Syntax: {err}")
                 st.stop()
 
             # Progress UI Elements
             prog_bar = st.progress(0.0)
             status_box = st.empty()
 
-            def ui_progress_callback(idx: int, total: int, step_desc: str):
-                fraction = float(idx / max(total, 1))
-                prog_bar.progress(min(fraction, 1.0))
-                status_box.info(f"**Step [{idx}/{total}]:** {step_desc}")
+            def ui_progress_callback(step_desc: str):
+                status_box.info(f"⏳ {step_desc}")
 
             try:
-                with st.spinner("Processing video engine pipeline..."):
-                    # Execute synchronous pipeline wrapper across asyncio event loop
+                with st.spinner(f"Processing {pipeline_mode.upper()} video engine pipeline..."):
                     output_file = asyncio.run(
-                        process_video_pipeline(
+                        asyncio.to_thread(
+                            process_video_pipeline,
                             script_data=parsed_script,
                             bing_cookie_u=bing_cookie,
                             voice_name=selected_voice,
+                            pipeline_mode=pipeline_mode,
                             progress_callback=ui_progress_callback
                         )
                     )
 
                 prog_bar.progress(1.0)
-                status_box.success("🎉 Video generation completed successfully!")
+                status_box.success(f"🎉 Master video rendered successfully in [{pipeline_mode.upper()}] mode!")
 
                 # Video Preview and Download Section
                 if os.path.exists(output_file):
@@ -203,6 +226,7 @@ with tabs[0]:
                         st.subheader("File Details")
                         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
                         st.write(f"• **Filename:** `{os.path.basename(output_file)}`")
+                        st.write(f"• **Mode:** `{pipeline_mode.upper()}`")
                         st.write(f"• **Size:** `{file_size_mb:.2f} MB`")
                         st.write(f"• **Resolution:** `1920x1080` (30 FPS)")
                         st.write(f"• **Voice Profile:** `{selected_voice}`")
@@ -225,28 +249,34 @@ with tabs[0]:
 # TAB 2: SCHEMA & SAMPLE
 # -------------------------------------------------------------
 with tabs[1]:
-    st.subheader("Pipeline Scene Lifecycle Specification")
+    st.subheader("Pipeline Modes Overview")
     st.markdown("""
-    | Sentence Sequence | Visual Pipeline Logic | Transition Behavior |
+    | Mode | Visual Logic | Audio & Timing |
     | :--- | :--- | :--- |
-    | **Sentence 1** | Scrapes & downloads unique landscape video from Pixabay matching query. | Exact TTS length + 0.4s fade-out. |
-    | **Sentence 2, 4, 6...** | Cycles background loop (`BG1`, `BG2`...) + Centered Bing/Pixabay image with equal margins. | Exact TTS length + 0.4s fade-out. |
-    | **Sentence 3, 5, 7...** | Procedural OpenCV animation dynamically rendered to TTS duration. | Exact TTS length + 0.4s fade-out. |
+    | **Default 3-Beat Pipeline** | Beat 1: Mixkit/Wikimedia stock b-roll video.<br>Beat 2: Looping background + die-cut stamp card.<br>Beat 3: Procedural OpenCV kinetic animation. | Cartesia TTS duration + 0.4s fade-out per scene. |
+    | **Whiteboard Animation Mode** | **Math / Text:** Living hand draws Malayalam text, English headers, and boxed LaTeX formulas.<br>**Visuals:** Hand sketches vector line art on pure white canvas via Bing AI / Wikimedia. | Visuals are drawn at the exact speed of the Cartesia TTS voiceover. |
     """)
+
+    st.subheader("Plain Text (.txt) Format Sample")
+    st.code("""Sentence in Malayalam | Optional prompt or LaTeX equation | Optional Title or Headline
+നമസ്കാരം, ഇത് ആദ്യ രംഗമാണ് | futuristic clean landscape
+ഐൻസ്റ്റീന്റെ ഊർജ്ജ സമവാക്യം | E = mc^2 | Mass Energy Equivalence
+മൂന്നാമത്തെ രംഗം | clean line art sketch of robotics""", language="text")
 
     st.subheader("Standard JSON Schema")
     st.code("""[
   {
     "sentence": "വാചകം ഇവിടെ ചേർക്കുക...",
-    "query": "pixabay search query",
-    "prompt": "bing image creator prompt",
-    "source": "bing"  // or "pixabay"
+    "query": "search query",
+    "prompt": "image prompt",
+    "equation": "i\\\\hbar \\\\frac{\\\\partial}{\\\\partial t}\\\\Psi = \\\\hat{H}\\\\Psi",
+    "formula_name": "Schrodinger Equation"
   }
 ]""", language="json")
 
 
 # -------------------------------------------------------------
-# TAB 3: ASSET & ANIMATION REGISTRY
+# TAB 3: REGISTERED ENGINES
 # -------------------------------------------------------------
 with tabs[2]:
     col_a1, col_a2 = st.columns(2)
@@ -257,10 +287,7 @@ with tabs[2]:
             st.markdown(f"**{idx}. {anim['name']}** (`{anim['id']}`)")
 
     with col_a2:
-        st.subheader("Current Background Library")
-        bgs = get_available_backgrounds()
-        if bgs:
-            for b in bgs:
-                st.write(f"• `{os.path.basename(b)}`")
-        else:
-            st.warning("No `.mp4` background files found in `assets/backgrounds/`.")
+        st.subheader("Whiteboard Subsystems")
+        st.write("• **FastLivingHandEngine:** 9 wrist-pivot poses + diffused studio shadows.")
+        st.write("• **Text & Math Engine:** Zhang-Suen morphological thinning + STIX / Computer Modern LaTeX.")
+        st.write("• **Vector Grid Ink Engine:** Continuous nearest-neighbor line revelation.")
