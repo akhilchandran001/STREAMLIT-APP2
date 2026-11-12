@@ -4,52 +4,26 @@ import logging
 import os
 import time
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 
 from modules.script_parser import process_video_pipeline
+from modules.text_parser import parse_input_script
 
 logger = logging.getLogger("VideoEngine.TelegramHandler")
 
-# Full rich onboarding message reflecting the 3-beat rhythm and Mixkit/Wikimedia engine
+# Temporary cache mapping user_id -> parsed script data
+PENDING_JOBS = {}
+
 START_MESSAGE = (
-    "🎬 **Welcome to the Automated Video Engine Bot!**\n\n"
-    "Send me a `.json` script file or paste your raw JSON text array to trigger video generation.\n\n"
-    "📋 **Scene Rhythm (Strict 3-Beat Cycle):**\n"
-    "• **Beat 1 (Scenes 1, 4, 7...):** Cinematic Landscape Video (Mixkit / Wikimedia Commons)\n"
-    "• **Beat 2 (Scenes 2, 5, 8...):** Looping Background + Stamp-Drop Image + Styled Typography Card\n"
-    "• **Beat 3 (Scenes 3, 6, 9...):** Procedural OpenCV Kinetic Animation (Velocity Ramp, 3D Orbit Freeze, Tape Slam)\n"
-    "• **Every Scene:** Standardized 1080p 30fps with 0.4s smooth fade transitions\n"
-    "• **Real-Time Delivery:** Each TTS audio, generated image, and scene MP4 is uploaded directly to your chat as it completes.\n\n"
-    "📝 **Expected JSON Schema:**\n"
-    "```json\n"
-    "[\n"
-    "  {\n"
-    "    \"sentence\": \"നമസ്കാരം, ഇത് ആദ്യത്തെ രംഗമാണ്.\",\n"
-    "    \"query\": \"futuristic technology nature\"\n"
-    "  },\n"
-    "  {\n"
-    "    \"sentence\": \"രണ്ടാമത്തെ രംഗത്തിൽ ഇമേജ് പശ്ചാത്തലത്തിൽ വരുന്നു.\",\n"
-    "    \"prompt\": \"ancient temple carved into floating mountain in clouds\",\n"
-    "    \"image_source\": \"auto\",\n"
-    "    \"headline\": {\n"
-    "      \"prefix\": \"Ancient\",\n"
-    "      \"highlight\": \"Temple\",\n"
-    "      \"suffix\": \"Mysteries\"\n"
-    "    }\n"
-    "  },\n"
-    "  {\n"
-    "    \"sentence\": \"മൂന്നാമത്തെ രംഗത്തിൽ അനിമേഷൻ വരുന്നു.\",\n"
-    "    \"prompt\": \"cybernetic neon vortex kinetic energy explosion, 8k\",\n"
-    "    \"source\": \"bing\"\n"
-    "  }\n"
-    "]\n"
-    "```"
+    "🎬 **Welcome to the Automated Video Engine Studio!**\n\n"
+    "Send me a `.json` or `.txt` file, or paste your script text.\n\n"
+    "⚙️ **Two Generation Modes:**\n"
+    "1️⃣ **Default 3-Beat Rhythm:** Stock landscape video + stamp card + procedural kinetic animation.\n"
+    "2️⃣ **Whiteboard Animation:** Pure hand-drawn animation with living hand physics, math LaTeX equations, and vector sketching (driven by Cartesia TTS durations and Bing image generation).\n"
 )
 
-
 def get_bing_cookies():
-    """Extracts all Bing cookies from Streamlit secrets or environment."""
     try:
         import streamlit as st
         if "BING_COOKIES" in st.secrets:
@@ -58,13 +32,9 @@ def get_bing_cookies():
             return st.secrets["BING_COOKIE_U"]
     except Exception:
         pass
-
-    env_cookies = os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
-    return env_cookies
-
+    return os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
 
 async def safe_edit_message(message: Message, text: str):
-    """Safely updates Telegram progress messages with FloodWait protection."""
     for attempt in range(3):
         try:
             await message.edit_text(text)
@@ -74,16 +44,33 @@ async def safe_edit_message(message: Message, text: str):
         except Exception:
             break
 
+async def prompt_user_mode_selection(client: Client, message: Message, script_data: list):
+    """Presents the two interactive buttons to the user before starting."""
+    user_id = message.from_user.id
+    job_key = f"{user_id}_{int(time.time())}"
+    PENDING_JOBS[job_key] = script_data
 
-async def execute_pipeline_for_user(client: Client, message: Message, script_data: list):
-    """Orchestrates pipeline execution, status progress, and real-time artifact delivery."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 Default Pipeline (Normal)", callback_data=f"mode:default:{job_key}"),
+            InlineKeyboardButton("✍️ Whiteboard Animation", callback_data=f"mode:whiteboard:{job_key}")
+        ]
+    ])
+
+    await message.reply_text(
+        f"📋 **Script Loaded Successfully!** ({len(script_data)} scene(s) detected)\n\n"
+        "Please choose your preferred animation engine:",
+        reply_markup=keyboard
+    )
+
+async def execute_pipeline_for_user(client: Client, message: Message, script_data: list, mode: str):
     chat_id = message.chat.id
-    status_msg = await message.reply_text("🚀 Pipeline Initialized! Processing script...")
+    status_msg = await message.reply_text(f"🚀 Initializing [{mode.upper()}] Pipeline...")
 
     bing_cookies = get_bing_cookies()
     output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
-    final_output_video = os.path.join(output_dir, f"video_{int(time.time())}.mp4")
+    final_output_video = os.path.join(output_dir, f"video_{mode}_{int(time.time())}.mp4")
 
     loop = asyncio.get_running_loop()
 
@@ -95,7 +82,6 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
 
     def artifact_callback(artifact_type: str, file_path: str, caption: str):
         if not os.path.exists(file_path):
-            logger.error(f"Cannot upload missing artifact: {file_path}")
             return
 
         async def _upload():
@@ -114,10 +100,8 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
                         )
                     return
                 except FloodWait as fw:
-                    logger.warning(f"FloodWait on {artifact_type}. Waiting {fw.value}s...")
                     await asyncio.sleep(fw.value)
                 except Exception as err:
-                    logger.error(f"Upload attempt {attempt + 1} failed: {err}")
                     if attempt == 2:
                         raise err
                     await asyncio.sleep(2)
@@ -126,7 +110,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
         try:
             future.result(timeout=300)
         except Exception as e:
-            logger.error(f"Upload failed or timed out for {file_path}: {e}")
+            logger.error(f"Upload failed: {e}")
 
     try:
         await loop.run_in_executor(
@@ -135,76 +119,71 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
                 script_data=script_data,
                 output_video_path=final_output_video,
                 bing_cookie=bing_cookies,
+                pipeline_mode=mode,
                 progress_callback=progress_callback,
                 artifact_callback=artifact_callback
             )
         )
         completion_text = (
-            f"✅ **Render Complete!**\n"
+            f"✅ **Render Complete! [{mode.upper()} MODE]**\n"
             f"• Scenes: {len(script_data)}\n"
-            f"• Resolution: 1920x1080 (30 FPS)\n"
-            f"• Fade Transitions: 0.4s applied per scene"
+            f"• Resolution: 1920x1080 (30 FPS)"
         )
         await safe_edit_message(status_msg, completion_text)
 
     except Exception as e:
         logger.exception("Pipeline execution failed")
-        await safe_edit_message(status_msg, f"❌ Pipeline Execution Failed:\n`{str(e)}`")
-
+        await safe_edit_message(status_msg, f"❌ Execution Failed:\n`{str(e)}`")
 
 # =====================================================================
-# COMMAND & MESSAGE HANDLERS
+# PYROGRAM HANDLERS
 # =====================================================================
 
 @Client.on_message(filters.command("start") & filters.private)
 async def handle_start_command(client: Client, message: Message):
-    """Responds to /start with the full engine guide and schema documentation."""
     await message.reply_text(START_MESSAGE, disable_web_page_preview=True)
 
-
 @Client.on_message(filters.document & filters.private)
-async def handle_json_document(client: Client, message: Message):
-    """Handles uploaded .json script files."""
-    if not message.document.file_name.endswith(".json"):
-        await message.reply_text("⚠️ Please upload a valid `.json` script file.")
+async def handle_document_upload(client: Client, message: Message):
+    fname = message.document.file_name.lower()
+    if not (fname.endswith(".json") or fname.endswith(".txt")):
+        await message.reply_text("⚠️ Please upload a valid `.json` or `.txt` file.")
         return
 
     temp_path = await message.download()
     try:
-        with open(temp_path, "r", encoding="utf-8") as f:
-            script_data = json.load(f)
-
-        if not isinstance(script_data, list):
-            await message.reply_text("❌ Invalid JSON schema: Root must be an array `[...]` of scene objects.")
-            return
-
-        await execute_pipeline_for_user(client, message, script_data)
-    except json.JSONDecodeError as err:
-        await message.reply_text(f"❌ Invalid JSON file syntax:\n`{str(err)}`")
+        with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw_text = f.read()
+        script_data = parse_input_script(raw_text)
+        await prompt_user_mode_selection(client, message, script_data)
+    except Exception as err:
+        await message.reply_text(f"❌ Could not parse file:\n`{str(err)}`")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-
 @Client.on_message(filters.text & filters.private)
-async def handle_json_text(client: Client, message: Message):
-    """Handles raw pasted JSON text or displays a helpful usage tip."""
+async def handle_raw_text(client: Client, message: Message):
     text = message.text.strip()
-
     if text.startswith("/"):
         return
 
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            script_data = json.loads(text)
-            if not isinstance(script_data, list):
-                await message.reply_text("❌ JSON root must be an array `[...]` of scene objects.")
-                return
-            await execute_pipeline_for_user(client, message, script_data)
-        except json.JSONDecodeError as err:
-            await message.reply_text(f"❌ JSON Syntax Error:\n`{str(err)}`")
-    else:
-        await message.reply_text(
-            "⚠️ Please send a valid JSON script array (starting with `[` and ending with `]`) "
-            "or upload a `.json` file.\n\nSend /start to view the expected format and schema."
-        )
+    try:
+        script_data = parse_input_script(text)
+        await prompt_user_mode_selection(client, message, script_data)
+    except Exception as err:
+        await message.reply_text(f"❌ Error parsing script text:\n`{str(err)}`")
+
+@Client.on_callback_query(filters.regex(r"^mode:(default|whiteboard):(.+)$"))
+async def handle_mode_callback(client: Client, callback: CallbackQuery):
+    mode = callback.matches[0].group(1)
+    job_key = callback.matches[0].group(2)
+
+    script_data = PENDING_JOBS.get(job_key)
+    if not script_data:
+        await callback.answer("⚠️ Session expired. Please re-send your script.", show_alert=True)
+        return
+
+    await callback.answer(f"Selected: {mode.title()} Mode")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await execute_pipeline_for_user(client, callback.message, script_data, mode=mode)
