@@ -12,8 +12,6 @@ import time
 
 import cv2
 import numpy as np
-
-# Headless Matplotlib configuration for formula rendering
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -28,7 +26,7 @@ from modules.ffmpeg_compositor import (
     get_stream_duration
 )
 
-# Whiteboard Subsystems
+# Whiteboard Engines
 from modules.whiteboard_text_math import generate_text_math_whiteboard
 from modules.whiteboard_image_anim import generate_native_whiteboard_animation
 
@@ -62,15 +60,10 @@ def compute_scene_hash(scene: dict, mode: str = "default") -> str:
 
 
 def is_valid_media_file(file_path: str, min_size_bytes: int = 5000) -> bool:
-    """Checks if a file exists, is non-empty, and has valid media content."""
     return os.path.exists(file_path) and os.path.getsize(file_path) >= min_size_bytes
 
 
 def is_valid_video_file(file_path: str, min_size_bytes: int = 20000) -> bool:
-    """
-    Verifies that a video file is completely written and playable.
-    Detects truncated / incomplete MP4s (e.g. missing moov atom) and deletes them.
-    """
     if not os.path.exists(file_path) or os.path.getsize(file_path) < min_size_bytes:
         return False
     try:
@@ -86,7 +79,6 @@ def is_valid_video_file(file_path: str, min_size_bytes: int = 20000) -> bool:
 
 
 def sanitize_mathtext(expr: str) -> str:
-    """Replaces unsupported LaTeX macros with valid mathtext equivalents."""
     cleaned = expr.strip()
     cleaned = re.sub(r'\\stackrel\{[^}]*\}\{=\}', r'\\approx', cleaned)
     cleaned = cleaned.replace(r'\implies', r'\Rightarrow')
@@ -101,12 +93,7 @@ def render_cinematic_equation_card(
     width: int = 1760,
     height: int = 870
 ) -> str:
-    """
-    Renders an exact LaTeX formula onto a dark obsidian cinematic card.
-    Guaranteed zero-crash with multi-stage fallback.
-    """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
     clean_expr = sanitize_mathtext(latex_equation)
     if not clean_expr.startswith("$"):
         clean_expr = f"${clean_expr}$"
@@ -147,7 +134,7 @@ def render_cinematic_equation_card(
             rendered_successfully = True
             break
         except Exception as err:
-            logger.warning(f"[EquationRenderer] Mathtext warning on attempt {attempt + 1}: {err}")
+            logger.warning(f"[EquationRenderer] Mathtext warning: {err}")
             if fig is not None:
                 plt.close(fig)
 
@@ -182,12 +169,10 @@ def render_cinematic_equation_card(
     final_card = np.clip(final_card.astype(np.float32) + glow_layer, 0, 255).astype(np.uint8)
 
     cv2.imwrite(output_path, final_card)
-    logger.info(f"[EquationRenderer] Rendered exact math card: {output_path}")
     return output_path
 
 
 def _execute_tts_with_retry(sentence: str, target_audio_path: str, voice_name: str = None) -> tuple[str, float]:
-    """Retries TTS voiceover generation up to 3 times on transient drops."""
     kwargs = {}
     if voice_name:
         kwargs["voice_name"] = voice_name
@@ -218,25 +203,19 @@ def _execute_tts_with_retry(sentence: str, target_audio_path: str, voice_name: s
             logger.warning(f"[TTS] Attempt {attempt + 1} failed: {e}")
             time.sleep(3)
 
-    raise RuntimeError(f"TTS failed completely for sentence: '{sentence[:40]}...'")
+    raise RuntimeError(f"TTS failed completely for: '{sentence[:40]}...'")
 
 
 def generate_emergency_fallback_image(output_path: str):
-    """Generates an emergency gradient card so pipeline never crashes on missing files."""
     h, w = 1080, 1920
-    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-    for y in range(h):
-        ratio = y / h
-        canvas[y, :] = [int(35 * (1 - ratio)), int(20 * (1 - ratio)), int(45 * ratio + 15)]
-    cv2.circle(canvas, (w // 2, h // 2), 220, (180, 80, 20), -1)
-    canvas = cv2.GaussianBlur(canvas, (101, 101), 0)
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+    cv2.rectangle(canvas, (120, 100), (1800, 980), (30, 30, 30), 4)
+    cv2.circle(canvas, (w // 2, h // 2), 220, (50, 50, 50), 3)
     cv2.imwrite(output_path, canvas)
 
 
 def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
-    """Acquires image using intelligent routing with complete two-way fallback."""
     if "equation" in scene and str(scene.get("equation", "")).strip():
-        logger.info(f"[ImageAcquisition] Equation detected. Rendering local math card...")
         formula_latex = str(scene["equation"]).strip()
         formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
         render_cinematic_equation_card(formula_latex, raw_img_path, formula_name=formula_name)
@@ -252,35 +231,33 @@ def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
 
     if prefer_ai and prompt_text:
         try:
-            logger.info(f"[ImageAcquisition] Trying Bing AI for: '{prompt_text}'")
             run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
             if is_valid_media_file(raw_img_path):
                 return raw_img_path
-        except Exception as e:
-            logger.warning(f"[ImageAcquisition] Bing AI failed ({e}). Falling back to Wikimedia...")
+        except Exception:
+            pass
 
         try:
             fetch_image(search_q, raw_img_path)
             if is_valid_media_file(raw_img_path):
                 return raw_img_path
-        except Exception as e2:
-            logger.warning(f"[ImageAcquisition] Wikimedia fallback failed ({e2}). Using emergency card.")
+        except Exception:
+            pass
     else:
         try:
-            logger.info(f"[ImageAcquisition] Trying Wikimedia Commons for: '{search_q}'")
             fetch_image(search_q, raw_img_path)
             if is_valid_media_file(raw_img_path):
                 return raw_img_path
-        except Exception as e:
-            logger.warning(f"[ImageAcquisition] Wikimedia failed ({e}). Falling back to Bing AI...")
+        except Exception:
+            pass
 
         if prompt_text:
             try:
                 run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
                 if is_valid_media_file(raw_img_path):
                     return raw_img_path
-            except Exception as e2:
-                logger.warning(f"[ImageAcquisition] Bing AI fallback failed ({e2}). Using emergency card.")
+            except Exception:
+                pass
 
     generate_emergency_fallback_image(raw_img_path)
     return raw_img_path
@@ -314,104 +291,135 @@ def process_video_pipeline(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_video_path)), exist_ok=True)
 
-    # Background files required ONLY in Default Mode
     available_bgs = []
     if pipeline_mode == "default":
         available_bgs = get_available_backgrounds(BG_DIR)
         if not available_bgs:
-            raise RuntimeError(f"No background videos found in '{BG_DIR}/'. Upload .mp4 backgrounds or switch to Whiteboard Mode.")
+            raise RuntimeError(f"No background videos found in '{BG_DIR}/'.")
+
+    # In Whiteboard mode, group scenes into 2-sentence pairs
+    if pipeline_mode == "whiteboard":
+        processed_units = []
+        i = 0
+        while i < len(script_data):
+            if i + 1 < len(script_data):
+                # Pair 2 sentences
+                s1 = script_data[i]
+                s2 = script_data[i+1]
+                combined_sentence = f"{s1.get('sentence', '').strip()} {s2.get('sentence', '').strip()}"
+                
+                # Check for equations in both
+                eq = s1.get("equation") or s2.get("equation") or ""
+                formula_title = s1.get("formula_name") or s2.get("formula_name") or s1.get("title") or s2.get("title") or ""
+                
+                # Prompt prefers the second or first
+                combined_prompt = s2.get("prompt") or s1.get("prompt") or ""
+                combined_query = s2.get("query") or s1.get("query") or ""
+
+                processed_units.append({
+                    "sentence": combined_sentence,
+                    "sentence_a": s1.get("sentence", "").strip(),
+                    "sentence_b": s2.get("sentence", "").strip(),
+                    "equation": eq,
+                    "formula_name": formula_title,
+                    "prompt": combined_prompt,
+                    "query": combined_query,
+                    "unit_id": f"pair_{i+1}_{i+2}"
+                })
+                i += 2
+            else:
+                # Odd remaining single sentence
+                s = script_data[i]
+                processed_units.append({
+                    "sentence": s.get("sentence", "").strip(),
+                    "sentence_a": s.get("sentence", "").strip(),
+                    "sentence_b": "",
+                    "equation": s.get("equation", ""),
+                    "formula_name": s.get("formula_name", ""),
+                    "prompt": s.get("prompt", ""),
+                    "query": s.get("query", ""),
+                    "unit_id": f"single_{i+1}"
+                })
+                i += 1
+    else:
+        processed_units = [dict(s, unit_id=f"scene_{idx+1}") for idx, s in enumerate(script_data)]
 
     scene_video_paths = []
     bg_cycle_idx = 0
     anim_cycle_idx = 0
-    total_scenes = len(script_data)
+    total_units = len(processed_units)
 
-    logger.info(f"Pipeline started for {total_scenes} scenes in [{pipeline_mode.upper()}] mode.")
+    logger.info(f"Pipeline running {total_units} unit(s) in [{pipeline_mode.upper()}] mode.")
 
-    def notify_progress(msg: str):
-        """Universal progress dispatcher that never crashes on argument variations."""
+    def notify(msg: str):
         if progress_callback:
             try:
                 progress_callback(msg)
-            except TypeError:
-                try:
-                    progress_callback(idx + 1, total_scenes, msg)
-                except Exception:
-                    pass
             except Exception:
                 pass
 
-    for idx, scene in enumerate(script_data):
-        scene_num = idx + 1
-        scene_prefix = f"scene_{scene_num:02d}"
-        s_hash = compute_scene_hash(scene, mode=pipeline_mode)
+    for idx, unit in enumerate(processed_units):
+        unit_num = idx + 1
+        unit_prefix = f"unit_{unit_num:02d}_{unit['unit_id']}"
+        s_hash = compute_scene_hash(unit, mode=pipeline_mode)
 
-        cached_scene_mp4 = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_rendered.mp4")
+        cached_mp4 = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_rendered.mp4")
 
-        # -------------------------------------------------------------
-        # 1. CHECKPOINT VERIFICATION (Ensures MP4 is uncorrupted)
-        # -------------------------------------------------------------
-        if is_valid_video_file(cached_scene_mp4, 50000):
-            logger.info(f"[{scene_prefix}] Found valid cached render. Reusing...")
-            notify_progress(f"Scene {scene_num}/{total_scenes}: Reusing completed cache...")
+        # 1. Checkpoint Verification
+        if is_valid_video_file(cached_mp4, 50000):
+            logger.info(f"[{unit_prefix}] Reusing cached render...")
+            notify(f"Unit {unit_num}/{total_units}: Reusing completed cache...")
             if artifact_callback:
-                artifact_callback("video", cached_scene_mp4, f"🎬 Scene {scene_num} (Cached)")
-            scene_video_paths.append(cached_scene_mp4)
+                artifact_callback("video", cached_mp4, f"🎬 Scene {unit_num} (Cached)")
+            scene_video_paths.append(cached_mp4)
             continue
-        elif os.path.exists(cached_scene_mp4):
+        elif os.path.exists(cached_mp4):
             try:
-                os.remove(cached_scene_mp4)
+                os.remove(cached_mp4)
             except Exception:
                 pass
 
-        sentence = scene.get("sentence", "").strip()
-        query_text = scene.get("query", "").strip()
-        prompt_text = scene.get("prompt", "").strip()
-        headline_data = scene.get("headline") or scene.get("heading") or scene.get("title", None)
-
+        sentence = unit.get("sentence", "").strip()
         if not sentence:
             continue
 
-        # -------------------------------------------------------------
-        # 2. VOICEOVER GENERATION (Exact duration drives visual clock)
-        # -------------------------------------------------------------
-        logger.info(f"[{scene_prefix}] Generating Voiceover...")
-        notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Voiceover...")
-
-        audio_target = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_tts.wav")
+        # 2. Voiceover Generation
+        notify(f"Unit {unit_num}/{total_units}: Generating Voiceover ({pipeline_mode.title()})...")
+        audio_target = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_tts.wav")
         if not is_valid_media_file(audio_target, 5000):
             audio_path, duration = _execute_tts_with_retry(sentence, audio_target, voice_name=voice_name)
         else:
             audio_path, duration = audio_target, get_stream_duration(audio_target)
 
         if artifact_callback:
-            artifact_callback("audio", audio_path, f"🎤 Scene {scene_num} Audio ({duration:.1f}s)")
+            artifact_callback("audio", audio_path, f"🎤 Scene {unit_num} Audio ({duration:.1f}s)")
 
-        rendered_scene_mp4 = cached_scene_mp4
+        rendered_scene_mp4 = cached_mp4
 
         # =============================================================
-        # WHITEBOARD MODE: Pure Hand-Drawn Math & Sketch Pipeline
+        # WHITEBOARD MODE: 2-Sentence Cohesive Hand-Drawing
         # =============================================================
         if pipeline_mode == "whiteboard":
-            raw_wb_silent = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_wb_raw.mp4")
+            raw_wb_silent = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_wb_raw.mp4")
+            has_eq = bool(unit.get("equation", "").strip())
 
-            has_eq = "equation" in scene and str(scene["equation"]).strip()
-            is_text_block = scene.get("type") in ["math", "heading", "blocks"]
-
-            if has_eq or is_text_block:
-                notify_progress(f"Scene {scene_num}/{total_scenes}: Hand-Drawing Math & Equations ({duration:.1f}s)...")
-
+            if has_eq:
+                notify(f"Unit {unit_num}/{total_units}: Drawing 2-Sentence Math Whiteboard ({duration:.1f}s)...")
                 blocks = []
-                title = str(scene.get("formula_name") or scene.get("title") or "").strip()
+                title = unit.get("formula_name") or unit.get("title") or ""
                 if title:
-                    blocks.append({"type": "heading", "text": title, "size": 60, "space_after": 20})
+                    blocks.append({"type": "heading", "text": title, "size": 56, "space_after": 18})
 
-                if sentence:
-                    blocks.append({"type": "malayalam", "text": sentence, "size": 46, "space_after": 24})
+                # First sentence
+                if unit.get("sentence_a"):
+                    blocks.append({"type": "malayalam", "text": unit["sentence_a"], "size": 42, "space_after": 16})
 
-                eq_str = str(scene.get("equation", "")).strip()
-                if eq_str:
-                    blocks.append({"type": "math", "latex": eq_str, "size": 34, "box": True, "space_after": 20})
+                # Math Formula
+                blocks.append({"type": "math", "latex": unit["equation"], "size": 32, "box": True, "space_after": 18})
+
+                # Second sentence underneath
+                if unit.get("sentence_b"):
+                    blocks.append({"type": "malayalam", "text": unit["sentence_b"], "size": 40, "space_after": 14})
 
                 generate_text_math_whiteboard(
                     content_blocks=blocks,
@@ -420,10 +428,9 @@ def process_video_pipeline(
                     fps=30
                 )
             else:
-                notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Line Art & Hand-Sketching ({duration:.1f}s)...")
-
-                wb_prompt = prompt_text or f"clean black and white line art vector sketch of {query_text}, pure white background, coloring book style"
-                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_wb_image.jpg")
+                notify(f"Unit {unit_num}/{total_units}: Sketching Vector Line Art ({duration:.1f}s)...")
+                wb_prompt = unit.get("prompt") or f"clean black and white line art vector sketch of {unit.get('query')}, pure white background, coloring book style"
+                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_wb_image.jpg")
 
                 if not is_valid_media_file(raw_img_path, 5000):
                     acquired = False
@@ -432,16 +439,16 @@ def process_video_pipeline(
                             run_sync_generate(wb_prompt, raw_img_path, cookie_u=effective_cookie)
                             acquired = is_valid_media_file(raw_img_path)
                         except Exception as e:
-                            logger.warning(f"Bing AI generation failed ({e}). Falling back to Wikimedia...")
+                            logger.warning(f"Bing AI failed ({e}). Falling back...")
 
                     if not acquired:
                         try:
-                            fetch_image(query_text or prompt_text, raw_img_path)
+                            fetch_image(unit.get("query") or wb_prompt, raw_img_path)
                         except Exception:
                             generate_emergency_fallback_image(raw_img_path)
 
                 if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Image")
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Image")
 
                 generate_native_whiteboard_animation(
                     img_path=raw_img_path,
@@ -450,7 +457,7 @@ def process_video_pipeline(
                     fps=30
                 )
 
-            # Mux Whiteboard video with Cartesia audio and smooth 0.4s fade
+            # Mux Whiteboard video with Cartesia audio and smooth fade
             render_individual_scene(
                 scene_type="animation",
                 audio_path=audio_path,
@@ -459,18 +466,18 @@ def process_video_pipeline(
             )
 
         # =============================================================
-        # DEFAULT MODE: Standard 3-Beat Pipeline (Video / Stamp / Kinetic)
+        # DEFAULT MODE: Standard 1-Sentence Rhythm
         # =============================================================
         else:
             scene_mode = idx % 3
+            query_text = unit.get("query", "").strip()
+            prompt_text = unit.get("prompt", "").strip()
+            headline_data = unit.get("headline", None)
 
-            # MODE 0: LANDSCAPE B-ROLL VIDEO
             if scene_mode == 0:
-                logger.info(f"[{scene_prefix}] Rendering Landscape Video")
-                notify_progress(f"Scene {scene_num}/{total_scenes}: Fetching Video Footage...")
-
+                notify(f"Scene {unit_num}/{total_units}: Fetching Stock Video...")
                 video_search_query = query_text or prompt_text or "space"
-                raw_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_raw_video.mp4")
+                raw_video_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_raw_video.mp4")
 
                 if not is_valid_video_file(raw_video_path, 20000):
                     if os.path.exists(raw_video_path):
@@ -481,40 +488,27 @@ def process_video_pipeline(
                     try:
                         fetch_landscape_video(video_search_query, raw_video_path)
                     except Exception as e:
-                        logger.warning(f"[{scene_prefix}] Stock video fetch failed ({e}). Using local fallback...")
+                        logger.warning(f"Stock video fetch failed ({e}). Using background fallback...")
 
                     if not is_valid_video_file(raw_video_path, 20000):
                         fallback_bg = available_bgs[bg_cycle_idx % len(available_bgs)]
                         shutil.copyfile(fallback_bg, raw_video_path)
 
-                try:
-                    render_individual_scene(
-                        scene_type="video",
-                        audio_path=audio_path,
-                        output_path=rendered_scene_mp4,
-                        video_path=raw_video_path
-                    )
-                except Exception as render_err:
-                    fallback_bg = available_bgs[bg_cycle_idx % len(available_bgs)]
-                    shutil.copyfile(fallback_bg, raw_video_path)
-                    render_individual_scene(
-                        scene_type="video",
-                        audio_path=audio_path,
-                        output_path=rendered_scene_mp4,
-                        video_path=raw_video_path
-                    )
+                render_individual_scene(
+                    scene_type="video",
+                    audio_path=audio_path,
+                    output_path=rendered_scene_mp4,
+                    video_path=raw_video_path
+                )
 
-            # MODE 1: BACKGROUND LOOP + STAMP CARD
             elif scene_mode == 1:
-                logger.info(f"[{scene_prefix}] Rendering Type 2 Stamp Drop")
-                notify_progress(f"Scene {scene_num}/{total_scenes}: Acquiring Image & Rendering Stamp...")
-
-                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_image.jpg")
+                notify(f"Scene {unit_num}/{total_units}: Rendering Stamp Card...")
+                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_image.jpg")
                 if not is_valid_media_file(raw_img_path, 5000):
-                    acquire_scene_image(scene, raw_img_path, effective_cookie)
+                    acquire_scene_image(unit, raw_img_path, effective_cookie)
 
                 if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🖼️ Scene {scene_num} Card")
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Card")
 
                 bg_loop_video = available_bgs[bg_cycle_idx % len(available_bgs)]
                 bg_cycle_idx += 1
@@ -528,36 +522,19 @@ def process_video_pipeline(
                     headline_data=headline_data
                 )
 
-            # MODE 2: KINETIC ANIMATION
             elif scene_mode == 2:
-                logger.info(f"[{scene_prefix}] Rendering Type 3 Kinetic Animation")
-                notify_progress(f"Scene {scene_num}/{total_scenes}: Generating Visual & Animation...")
-
-                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_ai_image.jpg")
+                notify(f"Scene {unit_num}/{total_units}: Generating Kinetic Animation...")
+                raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_ai_image.jpg")
                 if not is_valid_media_file(raw_img_path, 5000):
-                    if "equation" in scene and str(scene.get("equation", "")).strip():
-                        formula_latex = str(scene["equation"]).strip()
-                        formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
-                        render_cinematic_equation_card(formula_latex, raw_img_path, formula_name=formula_name)
+                    if unit.get("equation", "").strip():
+                        render_cinematic_equation_card(unit["equation"], raw_img_path, formula_name=unit.get("formula_name", ""))
                     else:
-                        acquired = False
-                        if prompt_text:
-                            try:
-                                run_sync_generate(prompt_text, raw_img_path, cookie_u=effective_cookie)
-                                acquired = is_valid_media_file(raw_img_path)
-                            except Exception as e:
-                                logger.warning(f"Bing AI failed ({e}). Trying fallback...")
-
-                        if not acquired:
-                            try:
-                                fetch_image(query_text or prompt_text, raw_img_path)
-                            except Exception:
-                                generate_emergency_fallback_image(raw_img_path)
+                        acquire_scene_image(unit, raw_img_path, effective_cookie)
 
                 if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🎨 Scene {scene_num} Visual")
+                    artifact_callback("image", raw_img_path, f"🎨 Scene {unit_num} Visual")
 
-                anim_video_path = os.path.join(CHECKPOINT_DIR, f"{scene_prefix}_{s_hash}_animation.mp4")
+                anim_video_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_animation.mp4")
                 render_animation_by_index(
                     image_path=raw_img_path,
                     output_path=anim_video_path,
@@ -575,20 +552,17 @@ def process_video_pipeline(
                 )
 
         if artifact_callback and is_valid_video_file(rendered_scene_mp4, 20000):
-            artifact_callback("video", rendered_scene_mp4, f"🎬 Scene {scene_num} Rendered MP4")
+            artifact_callback("video", rendered_scene_mp4, f"🎬 Scene {unit_num} Rendered MP4")
 
         scene_video_paths.append(rendered_scene_mp4)
 
-        # Rest Cooldown Heartbeat between scenes
-        if scene_num < total_scenes and rest_seconds_between_scenes > 0:
-            logger.info(f"Resting for {rest_seconds_between_scenes}s...")
+        if unit_num < total_units and rest_seconds_between_scenes > 0:
+            logger.info(f"Cooldown resting for {rest_seconds_between_scenes}s...")
             for remaining in range(rest_seconds_between_scenes, 0, -5):
-                notify_progress(f"⏳ Cooldown: Resting for {remaining}s...")
+                notify(f"⏳ Cooldown: Resting CPU for {remaining}s...")
                 time.sleep(min(5, remaining))
 
-    logger.info(f"Concatenating {len(scene_video_paths)} scenes...")
-    notify_progress("Concatenating all scenes into master video...")
-
+    notify("Concatenating all scenes into master video...")
     concat_all_scenes(scene_video_paths, output_video_path)
 
     if artifact_callback and is_valid_video_file(output_video_path, 50000):
