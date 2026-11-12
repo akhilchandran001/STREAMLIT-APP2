@@ -308,13 +308,13 @@ def process_video_pipeline(
                 s2 = script_data[i+1]
                 combined_sentence = f"{s1.get('sentence', '').strip()} {s2.get('sentence', '').strip()}"
                 
-                # Check for equations in both
+                # Check for equations (prefer s1, fallback to s2)
                 eq = s1.get("equation") or s2.get("equation") or ""
                 formula_title = s1.get("formula_name") or s2.get("formula_name") or s1.get("title") or s2.get("title") or ""
                 
-                # Prompt prefers the second or first
-                combined_prompt = s2.get("prompt") or s1.get("prompt") or ""
-                combined_query = s2.get("query") or s1.get("query") or ""
+                # PREFER FIRST SENTENCE (s1) PROMPT & QUERY AS REQUESTED
+                combined_prompt = s1.get("prompt") or s2.get("prompt") or ""
+                combined_query = s1.get("query") or s2.get("query") or ""
 
                 processed_units.append({
                     "sentence": combined_sentence,
