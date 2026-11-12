@@ -17,6 +17,35 @@ DEFAULT_EN_FONT = os.path.join(BASE_DIR, "assets", "fonts", "PatrickHand-Regular
 DEFAULT_ML_FONT = os.path.join(BASE_DIR, "assets", "fonts", "Chilanka-Regular.ttf")
 DEFAULT_HAND_IMG = os.path.join(BASE_DIR, "assets", "whiteboard", "alpha-hand.png")
 
+
+def _resolve_font(font_path: str, font_size: int):
+    """Loads custom font if present, otherwise gracefully falls back to installed system fonts."""
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, font_size)
+        except Exception:
+            pass
+
+    sys_fallbacks = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "/Library/Fonts/Arial.ttf"
+    ]
+    for fb in sys_fallbacks:
+        if os.path.exists(fb):
+            try:
+                return ImageFont.truetype(fb, font_size)
+            except Exception:
+                pass
+
+    try:
+        return ImageFont.load_default(size=font_size)
+    except Exception:
+        return ImageFont.load_default()
+
+
 def get_extreme_coordinates(mask):
     indices = np.where(mask > 0)
     if len(indices[0]) == 0 or len(indices[1]) == 0:
@@ -25,13 +54,14 @@ def get_extreme_coordinates(mask):
     bottomright = (int(np.max(indices[1])), int(np.max(indices[0])))
     return topleft, bottomright
 
+
 def preprocess_hand_image(hand_path, target_canvas_wd):
     if not os.path.exists(hand_path):
         alt = os.path.join(BASE_DIR, "assets", "whiteboard", "alpha-hand_2.png")
         if os.path.exists(alt):
             hand_path = alt
         else:
-            raise FileNotFoundError(f"Hand image not found at {hand_path}")
+            raise FileNotFoundError(f"Hand image not found at '{hand_path}'")
 
     hand_raw = cv2.imread(hand_path, cv2.IMREAD_UNCHANGED)
     if hand_raw is None:
@@ -88,6 +118,7 @@ def preprocess_hand_image(hand_path, target_canvas_wd):
 
     return hand_bgr, hand_alpha, tip_x, tip_y
 
+
 def draw_hand_with_extended_arm(canvas, hand_bgr, hand_alpha, tip_x, tip_y, target_x, target_y):
     canvas_ht, canvas_wd = canvas.shape[:2]
     origin_x = int(round(target_x)) - tip_x
@@ -127,6 +158,7 @@ def draw_hand_with_extended_arm(canvas, hand_bgr, hand_alpha, tip_x, tip_y, targ
     canvas_roi = canvas[c_y1:c_y2, c_x1:c_x2]
     canvas[c_y1:c_y2, c_x1:c_x2] = (canvas_roi * (1.0 - cropped_alpha) + cropped_hand * cropped_alpha).astype(np.uint8)
     return canvas
+
 
 def zhang_suen_thinning(binary_mask):
     padded = np.pad((binary_mask > 0).astype(np.uint8), 1, mode="constant", constant_values=0)
@@ -181,6 +213,7 @@ def zhang_suen_thinning(binary_mask):
             break
 
     return padded[1:-1, 1:-1]
+
 
 def trace_glyph_skeleton_strokes(glyph_mask, offset_x, offset_y, step_px=2.0):
     gh, gw = glyph_mask.shape[:2]
@@ -265,6 +298,7 @@ def trace_glyph_skeleton_strokes(glyph_mask, offset_x, offset_y, step_px=2.0):
 
     return traced_points
 
+
 def wrap_text_lines(text, font, max_width, lang="en"):
     has_raqm = features.check("raqm")
     raw_paragraphs = text.split("\n")
@@ -295,6 +329,7 @@ def wrap_text_lines(text, font, max_width, lang="en"):
 
     return wrapped_lines
 
+
 def render_math_equation_rgba(latex_str, font_size=36, color="#111111", dpi=240):
     fig = plt.figure(figsize=(12, 3), dpi=dpi)
     fig.patch.set_alpha(0.0)
@@ -324,12 +359,14 @@ def render_math_equation_rgba(latex_str, font_size=36, color="#111111", dpi=240)
 
     return buf[y1:y2, x1:x2].copy()
 
+
 def generate_line_stroke_points(x1, y, x2, step=2.5):
     if x2 <= x1:
         return [(int(x1), int(y))]
     n_pts = max(2, int(math.ceil((x2 - x1) / float(step))) + 1)
     xs = np.linspace(x1, x2, n_pts)
     return [(int(round(px)), int(y)) for px in xs]
+
 
 def generate_box_perimeter_points(x1, y1, x2, y2, step=2.5):
     pts = []
@@ -349,6 +386,7 @@ def generate_box_perimeter_points(x1, y1, x2, y2, step=2.5):
                 continue
             pts.append((int(round(xs[idx])), int(round(ys[idx]))))
     return pts
+
 
 def build_layout_and_stroke_tasks(content_blocks, canvas_wd, canvas_ht, en_font_path, ml_font_path, margin_x=90, margin_y=70):
     has_raqm = features.check("raqm")
@@ -378,9 +416,12 @@ def build_layout_and_stroke_tasks(content_blocks, canvas_wd, canvas_ht, en_font_
             lang = "ml" if (b_type == "malayalam" or has_malayalam_chars) else "en"
             font_path = ml_font_path if (lang == "ml" and os.path.exists(ml_font_path)) else en_font_path
 
-            font = ImageFont.truetype(font_path, font_size)
-            ascent, descent = font.getmetrics()
-            line_step = int((ascent + descent) * 1.28)
+            font = _resolve_font(font_path, font_size)
+            try:
+                ascent, descent = font.getmetrics()
+                line_step = int((ascent + descent) * 1.28)
+            except Exception:
+                line_step = int(font_size * 1.35)
 
             lines = wrap_text_lines(text, font, max_text_width, lang=lang)
             heading_min_x = canvas_wd
@@ -533,6 +574,7 @@ def build_layout_and_stroke_tasks(content_blocks, canvas_wd, canvas_ht, en_font_
     master_bgr = cv2.cvtColor(np.array(master_pil), cv2.COLOR_RGB2BGR)
     return master_bgr, stroke_tasks
 
+
 def extract_text_line_glyph_strokes(line_thresh):
     ink_binary = (line_thresh < 245).astype(np.uint8)
     if np.sum(ink_binary) == 0:
@@ -559,6 +601,7 @@ def extract_text_line_glyph_strokes(line_thresh):
         if pts:
             glyph_entries.append({"bbox": (g["x"], g["y"], g["w"], g["h"]), "mask": g["mask"], "points": pts})
     return glyph_entries
+
 
 def order_math_components_naturally(comps):
     if not comps:
@@ -643,6 +686,7 @@ def order_math_components_naturally(comps):
         ordered.extend(g["seq"])
     return ordered
 
+
 def extract_math_line_glyph_strokes(eq_thresh):
     ink_binary = (eq_thresh < 245).astype(np.uint8)
     if np.sum(ink_binary) == 0:
@@ -664,6 +708,7 @@ def extract_math_line_glyph_strokes(eq_thresh):
         if pts:
             glyph_entries.append({"bbox": (c["x"], c["y"], c["w"], c["h"]), "mask": c["mask"], "points": pts})
     return glyph_entries
+
 
 def generate_text_math_whiteboard(
     content_blocks: list[dict],
