@@ -4,3 +4,4 @@ libxext6
 libgl1
 fonts-dejavu-core
 fonts-liberation
+libraqm0
