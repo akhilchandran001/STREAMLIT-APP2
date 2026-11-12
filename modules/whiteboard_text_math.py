@@ -19,7 +19,7 @@ DEFAULT_HAND_IMG = os.path.join(BASE_DIR, "assets", "whiteboard", "alpha-hand.pn
 
 
 def _resolve_font(font_path: str, font_size: int):
-    """Loads custom font if present, otherwise gracefully falls back to installed system fonts."""
+    """Loads font with fallback to system fonts."""
     if font_path and os.path.exists(font_path):
         try:
             return ImageFont.truetype(font_path, font_size)
@@ -293,8 +293,12 @@ def trace_glyph_skeleton_strokes(glyph_mask, offset_x, offset_y, step_px=2.0):
             if idx == 0 or idx == len(stroke) - 1 or accum_dist >= step_px:
                 if 0 < idx < len(stroke) - 1:
                     accum_dist = 0.0
-                local_r = max(3, int(math.ceil(dist_map[py, px])) + 2)
-                traced_points.append((offset_x + px, offset_y + py, local_r))
+                
+                # SAFE CLAMPED RADIUS TO PREVENT C OVERFLOW ERROR
+                val = dist_map[py, px]
+                calc_r = int(math.ceil(val)) + 2 if not np.isnan(val) and not np.isinf(val) else 4
+                local_r = int(np.clip(calc_r, 2, 35))
+                traced_points.append((int(offset_x + px), int(offset_y + py), local_r))
 
     return traced_points
 
@@ -409,7 +413,7 @@ def build_layout_and_stroke_tasks(content_blocks, canvas_wd, canvas_ht, en_font_
             underline_thickness = block.get("underline_thickness", 5)
 
             text = block.get("text", "")
-            font_size = block.get("size", 62 if is_heading else 50)
+            font_size = block.get("size", 62 if is_heading else 48)
             color = tuple(block.get("color", (15, 23, 42)))
 
             has_malayalam_chars = any('\u0d00' <= ch <= '\u0d7f' for ch in text)
@@ -501,7 +505,7 @@ def build_layout_and_stroke_tasks(content_blocks, canvas_wd, canvas_ht, en_font_
 
         elif b_type == "math":
             latex_str = block.get("latex", "")
-            font_size = block.get("size", 36)
+            font_size = block.get("size", 34)
             color = block.get("color", "#111111")
             dpi = block.get("dpi", 240)
 
@@ -722,7 +726,7 @@ def generate_text_math_whiteboard(
     fps: int = 30,
     final_hold_sec: float = 1.0,
 ) -> str:
-    """Generates a text/math whiteboard video timed exactly to total_duration_sec."""
+    """Generates a text/math whiteboard video with safe bound math."""
     total_duration_sec = max(2.0, float(total_duration_sec))
     master_bgr, stroke_tasks = build_layout_and_stroke_tasks(
         content_blocks=content_blocks,
@@ -759,7 +763,7 @@ def generate_text_math_whiteboard(
                 t = step_i / float(n_steps + 1)
                 gx = sx + t * (target_x - sx)
                 gy = sy + t * (target_y - sy) - math.sin(math.pi * t) * lift_arc
-                timeline_steps.append(("glide", gx, gy, 0, None))
+                timeline_steps.append(("glide", int(gx), int(gy), 0, None))
 
     for task in stroke_tasks:
         if task["kind"] in ("text_line", "math_line"):
@@ -770,23 +774,23 @@ def generate_text_math_whiteboard(
                     continue
                 append_pen_lift_glide(pts[0][0], pts[0][1])
                 for px, py, radius in pts:
-                    timeline_steps.append(("draw_glyph", px, py, radius, g_entry))
+                    timeline_steps.append(("draw_glyph", int(px), int(py), int(radius), g_entry))
                     last_nib_pos = (px, py)
                 end_px, end_py, _ = pts[-1]
-                timeline_steps.append(("snap_glyph", end_px, end_py, 0, g_entry))
+                timeline_steps.append(("snap_glyph", int(end_px), int(end_py), 0, g_entry))
 
         elif task["kind"] == "vector_stroke":
             pts = task["points"]
-            v_r = task["brush_r"]
+            v_r = int(task["brush_r"])
             if not pts:
                 continue
             append_pen_lift_glide(pts[0][0], pts[0][1])
             task_mask_bool = (task["mask"] < 245)
             for px, py in pts:
-                timeline_steps.append(("draw_vector", px, py, v_r, task_mask_bool))
+                timeline_steps.append(("draw_vector", int(px), int(py), v_r, task_mask_bool))
                 last_nib_pos = (px, py)
             end_px, end_py = pts[-1]
-            timeline_steps.append(("snap_vector", end_px, end_py, 0, task_mask_bool))
+            timeline_steps.append(("snap_vector", int(end_px), int(end_py), 0, task_mask_bool))
 
     num_steps = len(timeline_steps)
     hand_bgr, hand_alpha, tip_x, tip_y = preprocess_hand_image(hand_path, canvas_wd)
@@ -805,11 +809,20 @@ def generate_text_math_whiteboard(
 
         while prev_step_idx < target_step_idx:
             kind, px, py, radius, payload = timeline_steps[prev_step_idx]
+            
+            # SAFE NUMERICAL BOUNDS TO PREVENT C-LONG OVERFLOW
+            px = int(np.clip(px, 0, canvas_wd - 1))
+            py = int(np.clip(py, 0, canvas_ht - 1))
+            radius = int(np.clip(radius, 1, 35))
+
             if kind == "draw_glyph":
                 gx, gy, gw, gh = payload["bbox"]
                 g_mask = payload["mask"] > 0
-                y1, y2 = max(gy, py - radius), min(gy + gh, py + radius + 1)
-                x1, x2 = max(gx, px - radius), min(gx + gw, px + radius + 1)
+                y1 = int(max(gy, py - radius))
+                y2 = int(min(gy + gh, py + radius + 1))
+                x1 = int(max(gx, px - radius))
+                x2 = int(min(gx + gw, px + radius + 1))
+
                 if y2 > y1 and x2 > x1:
                     cy, cx = np.ogrid[y1 - py : y2 - py, x1 - px : x2 - px]
                     local_g = g_mask[y1 - gy : y2 - gy, x1 - gx : x2 - gx]
@@ -822,8 +835,11 @@ def generate_text_math_whiteboard(
                 drawn_canvas[gy:gy+gh, gx:gx+gw][g_mask] = master_bgr[gy:gy+gh, gx:gx+gw][g_mask]
 
             elif kind == "draw_vector":
-                y1, y2 = max(0, py - radius), min(canvas_ht, py + radius + 1)
-                x1, x2 = max(0, px - radius), min(canvas_wd, px + radius + 1)
+                y1 = int(max(0, py - radius))
+                y2 = int(min(canvas_ht, py + radius + 1))
+                x1 = int(max(0, px - radius))
+                x2 = int(min(canvas_wd, px + radius + 1))
+
                 if y2 > y1 and x2 > x1:
                     cy, cx = np.ogrid[y1 - py : y2 - py, x1 - px : x2 - px]
                     stamp = ((cx * cx + cy * cy) <= (radius * radius)) & payload[y1:y2, x1:x2]
@@ -839,7 +855,7 @@ def generate_text_math_whiteboard(
         if frac > 0.0 and 0 < target_step_idx < num_steps:
             p0 = timeline_steps[target_step_idx - 1]
             p1 = timeline_steps[target_step_idx]
-            render_nib_pos = (p0[1] + frac * (p1[1] - p0[1]), p0[2] + frac * (p1[2] - p0[2]))
+            render_nib_pos = (float(p0[1] + frac * (p1[1] - p0[1])), float(p0[2] + frac * (p1[2] - p0[2])))
         else:
             render_nib_pos = active_nib_pos
 
