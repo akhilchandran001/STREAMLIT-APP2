@@ -9,8 +9,16 @@ import numpy as np
 BASE_DIR = os.getcwd()
 DEFAULT_HAND_IMG = os.path.join(BASE_DIR, "assets", "whiteboard", "alpha-hand.png")
 
+# Border & Canvas Configuration
+BORDER_RED_BGR = (20, 20, 220)      # High-intensity Red
+BORDER_THICKNESS = 4                # Clean crisp single-line border
+BORDER_MARGIN_X = 14                # 14px from left/right edges
+BORDER_MARGIN_Y = 12                # 12px from top/bottom edges (touches boundaries without overflow)
+
+
 def euc_dist_sq(arr1, point):
     return np.sum((arr1 - point) ** 2, axis=1)
+
 
 def get_extreme_coordinates(mask):
     indices = np.where(mask > 0)
@@ -20,10 +28,11 @@ def get_extreme_coordinates(mask):
     bottomright = (int(np.max(indices[1])), int(np.max(indices[0])))
     return topleft, bottomright
 
-def preprocess_image_with_border(img_path, target_wd=1920, target_ht=1080):
+
+def preprocess_image_fullscreen(img_path, target_wd=1920, target_ht=1080):
     """
-    Fits any non-16:9 image onto a 1920x1080 white canvas and adds an attractive
-    die-cut sketch border with double-line accent so viewers identify image edges.
+    Crops whitespace margins from the generated image, scales it up to maximize
+    full-screen height with minimum gap top and bottom, and centers it on the canvas.
     """
     if not os.path.exists(img_path):
         raise FileNotFoundError(f"Input image not found: {img_path}")
@@ -31,31 +40,46 @@ def preprocess_image_with_border(img_path, target_wd=1920, target_ht=1080):
     if src is None:
         raise ValueError(f"Failed to read image from {img_path}")
 
-    sh, sw = src.shape[:2]
-    # Max dimensions inside canvas leaving comfortable margin
-    max_w = target_wd - 240
-    max_h = target_ht - 160
-    scale = min(max_w / float(sw), max_h / float(sh), 1.0)
-    nw, nh = int(sw * scale), int(sh * scale)
-    resized_photo = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
+    # 1. Auto-crop empty outer white margins so the artwork expands to maximum scale
+    gray_src = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+    ink_ys, ink_xs = np.where(gray_src < 235)
+    if len(ink_ys) > 0 and len(ink_xs) > 0:
+        pad = 8
+        x1 = max(0, int(np.min(ink_xs)) - pad)
+        y1 = max(0, int(np.min(ink_ys)) - pad)
+        x2 = min(src.shape[1], int(np.max(ink_xs)) + pad + 1)
+        y2 = min(src.shape[0], int(np.max(ink_ys)) + pad + 1)
+        content_crop = src[y1:y2, x1:x2]
+    else:
+        content_crop = src
 
+    sh, sw = content_crop.shape[:2]
+
+    # 2. Maximum dimensions inside the red border (leaving 8px inner breathing room)
+    bx1 = BORDER_MARGIN_X
+    by1 = BORDER_MARGIN_Y
+    bx2 = target_wd - BORDER_MARGIN_X
+    by2 = target_ht - BORDER_MARGIN_Y
+
+    inner_pad = 8
+    avail_w = (bx2 - bx1) - 2 * inner_pad   # ~1876px
+    avail_h = (by2 - by1) - 2 * inner_pad   # ~1040px (fills 97% of 1080 height!)
+
+    scale = min(avail_w / float(sw), avail_h / float(sh))
+    nw = max(10, int(sw * scale))
+    nh = max(10, int(sh * scale))
+    resized_art = cv2.resize(content_crop, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    # 3. Center inside master canvas without border yet (Border is drawn last by the hand)
     canvas = np.full((target_ht, target_wd, 3), 255, dtype=np.uint8)
     ox = (target_wd - nw) // 2
     oy = (target_ht - nh) // 2
-
-    # Paste the photo
-    canvas[oy:oy+nh, ox:ox+nw] = resized_photo
-
-    # Attractive Die-Cut Dual Border
-    # Outer crisp line
-    b_color = (25, 25, 25)
-    cv2.rectangle(canvas, (ox - 8, oy - 8), (ox + nw + 8, oy + nh + 8), b_color, 4, cv2.LINE_AA)
-    # Inner accent fine sketch line
-    cv2.rectangle(canvas, (ox - 16, oy - 16), (ox + nw + 16, oy + nh + 16), (160, 160, 160), 2, cv2.LINE_AA)
+    canvas[oy:oy+nh, ox:ox+nw] = resized_art
 
     img_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     _, img_thresh = cv2.threshold(img_gray, 220, 255, cv2.THRESH_BINARY)
-    return canvas, img_thresh, target_ht, target_wd
+    return canvas, img_thresh, target_ht, target_wd, (bx1, by1, bx2, by2)
+
 
 def extract_single_hand_rgba(hand_path, target_canvas_wd):
     if not os.path.exists(hand_path):
@@ -290,6 +314,27 @@ class FastLivingHandEngine:
         return (c_y1, c_y2, c_x1, c_x2, backup_patch)
 
 
+def generate_box_perimeter_steps(x1, y1, x2, y2, step_px=3.0):
+    """Generates continuous clockwise perimeter coordinates (Top -> Right -> Bottom -> Left)."""
+    edges = [
+        (x1, y1, x2, y1),  # Top: Left -> Right
+        (x2, y1, x2, y2),  # Right: Top -> Bottom
+        (x2, y2, x1, y2),  # Bottom: Right -> Left
+        (x1, y2, x1, y1),  # Left: Bottom -> Top
+    ]
+    pts = []
+    for sx, sy, ex, ey in edges:
+        dist = math.hypot(ex - sx, ey - sy)
+        n_pts = max(2, int(math.ceil(dist / float(step_px))) + 1)
+        xs = np.linspace(sx, ex, n_pts)
+        ys = np.linspace(sy, ey, n_pts)
+        for idx in range(len(xs)):
+            if idx == 0 and pts:
+                continue
+            pts.append((int(round(xs[idx])), int(round(ys[idx]))))
+    return pts
+
+
 def render_whiteboard_sequence(
     drawn_canvas,
     orig_bgr_padded,
@@ -305,7 +350,7 @@ def render_whiteboard_sequence(
 ):
     total_blocks = len(cut_black_indices)
     if total_blocks == 0:
-        return current_frame_count
+        return current_frame_count, (orig_wd // 2, orig_ht // 2)
 
     selected_ind = 0
     blocks_drawn = 0
@@ -362,7 +407,8 @@ def render_whiteboard_sequence(
 
             prev_hand_pos = curr_hand_pos
 
-    return current_frame_count
+    last_pos = prev_hand_pos if prev_hand_pos is not None else (orig_wd // 2, orig_ht // 2)
+    return current_frame_count, last_pos
 
 
 def generate_native_whiteboard_animation(
@@ -375,9 +421,14 @@ def generate_native_whiteboard_animation(
     black_pixel_threshold: int = 10,
     final_hold_sec: float = 1.0,
 ) -> str:
-    """Animates drawing of any image with centered framing and die-cut borders."""
+    """
+    Renders whiteboard drawing:
+    1. Full-screen auto-cropped illustration drawn first.
+    2. Single-line red bounding box framing the screen drawn last.
+    3. Hand exits smoothly off-screen into final hold.
+    """
     total_duration_sec = max(2.0, float(total_duration_sec))
-    orig_bgr, img_thresh, orig_ht, orig_wd = preprocess_image_with_border(img_path)
+    orig_bgr, img_thresh, orig_ht, orig_wd, (bx1, by1, bx2, by2) = preprocess_image_fullscreen(img_path)
 
     pad_h = (split_len - (orig_ht % split_len)) % split_len
     pad_w = (split_len - (orig_wd % split_len)) % split_len
@@ -395,9 +446,18 @@ def generate_native_whiteboard_animation(
 
     hand_engine = FastLivingHandEngine(hand_path, orig_wd, orig_ht)
 
+    # Timing Budget
     total_target_frames = int(round(total_duration_sec * fps))
-    final_hold_frames = min(int(round(final_hold_sec * fps)), int(total_target_frames * 0.20))
-    drawing_target_frames = max(1, total_target_frames - final_hold_frames)
+    final_hold_frames = min(int(round(final_hold_sec * fps)), int(total_target_frames * 0.16))
+    remaining_frames = max(2, total_target_frames - final_hold_frames)
+    exit_frames = min(8, max(3, int(round(0.26 * fps)))) if remaining_frames >= 20 else 0
+    active_draw_frames = max(2, remaining_frames - exit_frames)
+
+    # Allocate 84% time for drawing the illustration and 16% time for drawing the final red border
+    box_draw_frames = max(14, min(int(active_draw_frames * 0.16), int(round(1.1 * fps))))
+    if active_draw_frames - box_draw_frames < 20:
+        box_draw_frames = max(8, int(active_draw_frames * 0.14))
+    art_draw_frames = active_draw_frames - box_draw_frames
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -411,20 +471,82 @@ def generate_native_whiteboard_animation(
     black_coords = np.array(np.where(has_black > 0)).T
 
     current_frames = 0
-    current_frames = render_whiteboard_sequence(
+    canvas_view = drawn_canvas[:orig_ht, :orig_wd]
+
+    # =============================================================
+    # STAGE 1: DRAW THE FULL-SCREEN ILLUSTRATION (STARS, GALAXY, PLANET)
+    # =============================================================
+    current_frames, last_nib = render_whiteboard_sequence(
         drawn_canvas, orig_bgr_padded, grid_of_cuts, black_coords,
         split_len, orig_ht, orig_wd, hand_engine, video_writer,
-        drawing_target_frames, current_frames
+        art_draw_frames, current_frames
     )
 
-    clean_finished_sketch = drawn_canvas[:orig_ht, :orig_wd]
-    while current_frames < drawing_target_frames:
-        video_writer.write(clean_finished_sketch)
+    # Ensure all illustration ink is 100% crisp before border starts
+    drawn_canvas[:orig_ht, :orig_wd] = orig_bgr[:orig_ht, :orig_wd]
+
+    # =============================================================
+    # STAGE 2: DRAW THE SINGLE-LINE RED BORDER AT THE VERY END
+    # =============================================================
+    box_pts = generate_box_perimeter_steps(bx1, by1, bx2, by2, step_px=3.0)
+    total_box_steps = len(box_pts)
+
+    # Glide from last illustration position to the top-left start of the red border
+    start_bx, start_by = box_pts[0]
+    glide_steps = 4
+    for g_i in range(glide_steps):
+        t = (g_i + 1) / float(glide_steps)
+        gx = int(round(last_nib[0] + t * (start_bx - last_nib[0])))
+        gy = int(round(last_nib[1] + t * (start_by - last_nib[1])))
+        restore_info = hand_engine.render_hand_in_place(canvas_view, gx, gy, is_lifted=True)
+        video_writer.write(canvas_view)
+        if restore_info is not None:
+            cy1, cy2, cx1, cx2, patch = restore_info
+            canvas_view[cy1:cy2, cx1:cx2] = patch
+
+    # Draw the red box clockwise
+    prev_pt = (start_bx, start_by)
+    prev_box_idx = 0
+
+    for b_frame in range(box_draw_frames):
+        prog = (b_frame + 1) / float(box_draw_frames)
+        target_idx = min(total_box_steps, max(1, int(math.floor(prog * total_box_steps))))
+
+        while prev_box_idx < target_idx:
+            curr_pt = box_pts[prev_box_idx]
+            cv2.line(canvas_view, prev_pt, curr_pt, BORDER_RED_BGR, BORDER_THICKNESS, cv2.LINE_AA)
+            prev_pt = curr_pt
+            prev_box_idx += 1
+
+        nib_pos = box_pts[min(target_idx, total_box_steps - 1)]
+        restore_info = hand_engine.render_hand_in_place(canvas_view, nib_pos[0], nib_pos[1], is_lifted=False)
+        video_writer.write(canvas_view)
+        if restore_info is not None:
+            cy1, cy2, cx1, cx2, patch = restore_info
+            canvas_view[cy1:cy2, cx1:cx2] = patch
         current_frames += 1
 
+    # Close any sub-pixel seam on the red rectangle perfectly
+    cv2.rectangle(canvas_view, (bx1, by1), (bx2, by2), BORDER_RED_BGR, BORDER_THICKNESS, cv2.LINE_AA)
+
+    # =============================================================
+    # STAGE 3: SMOOTH HAND EXIT & FINAL HOLD
+    # =============================================================
+    if exit_frames > 0:
+        start_x, start_y = box_pts[0]
+        end_y = float(orig_ht + 140)
+        for e_i in range(1, exit_frames + 1):
+            t = e_i / float(exit_frames)
+            ease_t = t * t
+            cur_y = start_y + ease_t * (end_y - start_y)
+            restore_info = hand_engine.render_hand_in_place(canvas_view, start_x, int(cur_y), is_lifted=True)
+            video_writer.write(canvas_view)
+            if restore_info is not None:
+                cy1, cy2, cx1, cx2, patch = restore_info
+                canvas_view[cy1:cy2, cx1:cx2] = patch
+
     for _ in range(final_hold_frames):
-        video_writer.write(clean_finished_sketch)
-        current_frames += 1
+        video_writer.write(canvas_view)
 
     video_writer.release()
     return output_path
