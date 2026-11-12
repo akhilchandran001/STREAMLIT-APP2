@@ -174,7 +174,7 @@ with tabs[0]:
             height=260
         )
     else:
-        uploaded_file = st.file_uploader("Upload Script File", type=["json", "txt"])
+        uploaded_file = st.file_uploader("Upload Script File (.json or .txt)", type=["json", "txt"])
         if uploaded_file:
             raw_script_content = uploaded_file.read().decode("utf-8", errors="ignore")
 
@@ -197,20 +197,18 @@ with tabs[0]:
             prog_bar = st.progress(0.0)
             status_box = st.empty()
 
-            def ui_progress_callback(step_desc: str):
+            def ui_progress_callback(step_desc: str, *args, **kwargs):
                 status_box.info(f"⏳ {step_desc}")
 
             try:
                 with st.spinner(f"Processing {pipeline_mode.upper()} video engine pipeline..."):
-                    output_file = asyncio.run(
-                        asyncio.to_thread(
-                            process_video_pipeline,
-                            script_data=parsed_script,
-                            bing_cookie_u=bing_cookie,
-                            voice_name=selected_voice,
-                            pipeline_mode=pipeline_mode,
-                            progress_callback=ui_progress_callback
-                        )
+                    # Directly execute synchronous pipeline without crashing asyncio.run()
+                    output_file = process_video_pipeline(
+                        script_data=parsed_script,
+                        bing_cookie_u=bing_cookie,
+                        voice_name=selected_voice,
+                        pipeline_mode=pipeline_mode,
+                        progress_callback=ui_progress_callback
                     )
 
                 prog_bar.progress(1.0)
