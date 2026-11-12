@@ -20,29 +20,42 @@ def get_extreme_coordinates(mask):
     bottomright = (int(np.max(indices[1])), int(np.max(indices[0])))
     return topleft, bottomright
 
-def preprocess_image_original_size(img_path):
+def preprocess_image_with_border(img_path, target_wd=1920, target_ht=1080):
+    """
+    Fits any non-16:9 image onto a 1920x1080 white canvas and adds an attractive
+    die-cut sketch border with double-line accent so viewers identify image edges.
+    """
     if not os.path.exists(img_path):
         raise FileNotFoundError(f"Input image not found: {img_path}")
-    img = cv2.imread(img_path)
-    if img is None:
+    src = cv2.imread(img_path)
+    if src is None:
         raise ValueError(f"Failed to read image from {img_path}")
 
-    # Scale/fit cleanly onto standard 1920x1080 canvas if needed
-    h, w = img.shape[:2]
-    if w != 1920 or h != 1080:
-        scale = min(1700 / w, 920 / h)
-        nw, nh = int(w * scale), int(h * scale)
-        img_resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-        canvas = np.full((1080, 1920, 3), 255, dtype=np.uint8)
-        x_off = (1920 - nw) // 2
-        y_off = (1080 - nh) // 2
-        canvas[y_off:y_off+nh, x_off:x_off+nw] = img_resized
-        img = canvas
+    sh, sw = src.shape[:2]
+    # Max dimensions inside canvas leaving comfortable margin
+    max_w = target_wd - 240
+    max_h = target_ht - 160
+    scale = min(max_w / float(sw), max_h / float(sh), 1.0)
+    nw, nh = int(sw * scale), int(sh * scale)
+    resized_photo = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    orig_ht, orig_wd = img.shape[:2]
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    canvas = np.full((target_ht, target_wd, 3), 255, dtype=np.uint8)
+    ox = (target_wd - nw) // 2
+    oy = (target_ht - nh) // 2
+
+    # Paste the photo
+    canvas[oy:oy+nh, ox:ox+nw] = resized_photo
+
+    # Attractive Die-Cut Dual Border
+    # Outer crisp line
+    b_color = (25, 25, 25)
+    cv2.rectangle(canvas, (ox - 8, oy - 8), (ox + nw + 8, oy + nh + 8), b_color, 4, cv2.LINE_AA)
+    # Inner accent fine sketch line
+    cv2.rectangle(canvas, (ox - 16, oy - 16), (ox + nw + 16, oy + nh + 16), (160, 160, 160), 2, cv2.LINE_AA)
+
+    img_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     _, img_thresh = cv2.threshold(img_gray, 220, 255, cv2.THRESH_BINARY)
-    return img, img_thresh, orig_ht, orig_wd
+    return canvas, img_thresh, target_ht, target_wd
 
 def extract_single_hand_rgba(hand_path, target_canvas_wd):
     if not os.path.exists(hand_path):
@@ -50,7 +63,7 @@ def extract_single_hand_rgba(hand_path, target_canvas_wd):
         if os.path.exists(alt):
             hand_path = alt
         else:
-            raise FileNotFoundError(f"Hand image not found: {hand_path}")
+            raise FileNotFoundError(f"Hand image not found at '{hand_path}'")
 
     hand_raw = cv2.imread(hand_path, cv2.IMREAD_UNCHANGED)
     if hand_raw is None:
@@ -145,6 +158,7 @@ def extract_single_hand_rgba(hand_path, target_canvas_wd):
     tip_x = int(tip_x + pad_left)
     tip_y = int(tip_y + pad_top)
     return canvas_bgr, canvas_alpha, tip_x, tip_y
+
 
 class FastLivingHandEngine:
     def __init__(self, hand_path, orig_wd, orig_ht):
@@ -275,6 +289,7 @@ class FastLivingHandEngine:
         canvas_view[c_y1:c_y2, c_x1:c_x2] = ((roi_slice.astype(np.uint16) * crop_inv_t) >> 8).astype(np.uint8) + crop_premul
         return (c_y1, c_y2, c_x1, c_x2, backup_patch)
 
+
 def render_whiteboard_sequence(
     drawn_canvas,
     orig_bgr_padded,
@@ -349,6 +364,7 @@ def render_whiteboard_sequence(
 
     return current_frame_count
 
+
 def generate_native_whiteboard_animation(
     img_path: str,
     output_path: str,
@@ -359,9 +375,9 @@ def generate_native_whiteboard_animation(
     black_pixel_threshold: int = 10,
     final_hold_sec: float = 1.0,
 ) -> str:
-    """Animates drawing of any image with the living hand engine, timed to total_duration_sec."""
+    """Animates drawing of any image with centered framing and die-cut borders."""
     total_duration_sec = max(2.0, float(total_duration_sec))
-    orig_bgr, img_thresh, orig_ht, orig_wd = preprocess_image_original_size(img_path)
+    orig_bgr, img_thresh, orig_ht, orig_wd = preprocess_image_with_border(img_path)
 
     pad_h = (split_len - (orig_ht % split_len)) % split_len
     pad_w = (split_len - (orig_wd % split_len)) % split_len
