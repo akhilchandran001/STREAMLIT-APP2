@@ -1,4 +1,5 @@
-import json
+from collections import Counter
+import gc
 import logging
 import os
 import subprocess
@@ -105,7 +106,7 @@ def render_individual_scene(
             "-i", audio_path,
             "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "2",
             "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
             "-t", f"{duration:.3f}",
             output_path
@@ -132,7 +133,7 @@ def render_individual_scene(
             "-i", audio_path,
             "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "2",
             "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
             "-t", f"{duration:.3f}",
             output_path
@@ -141,14 +142,12 @@ def render_individual_scene(
         if os.path.exists(temp_raw):
             os.remove(temp_raw)
 
-    # SCENE TYPE 3: Whiteboard / Kinetic Animation / Newspaper (Native Dimensions Preserved!)
+    # SCENE TYPE 3: Whiteboard / Kinetic Animation / Newspaper (Native Dimensions Preserved)
     elif scene_type == "animation":
         if has_tts and has_sfx:
-            # TTS at 1.35x; gentle sidechain ducking (ratio=3.5) keeps SFX audible
-            # without clashing over spoken words.
             sfx_gain = max(0.0, min(0.75, float(sfx_volume) * 0.90))
             filter_str = (
-                f"[0:v]format=yuv420p,{v_fade}[v];"
+                f"[0:v]fps=30,format=yuv420p,setsar=1,{v_fade}[v];"
                 f"[1:a]{a_std},volume=1.35,apad,asplit=2[tts_mix][tts_sc];"
                 f"[2:a]{a_std},volume={sfx_gain:.3f},apad[sfx_raw];"
                 f"[sfx_raw][tts_sc]sidechaincompress=threshold=0.04:ratio=3.5:attack=10:release=160:makeup=1[sfx_ducked];"
@@ -162,35 +161,34 @@ def render_individual_scene(
                 "-i", sfx_audio_path,
                 "-filter_complex", filter_str,
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "2",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
                 "-t", f"{duration:.3f}",
                 output_path
             ]
         elif has_sfx and not has_tts:
             sfx_gain = max(0.0, min(1.0, float(sfx_volume) if sfx_volume > 0 else 0.85))
-            filter_str = f"[0:v]format=yuv420p,{v_fade}[v];[1:a]{a_std},volume={sfx_gain:.3f},alimiter=limit=0.97,{a_fade}[a]"
+            filter_str = f"[0:v]fps=30,format=yuv420p,setsar=1,{v_fade}[v];[1:a]{a_std},volume={sfx_gain:.3f},alimiter=limit=0.97,{a_fade}[a]"
             cmd = [
                 "ffmpeg", "-y",
                 "-i", animation_video_path,
                 "-i", sfx_audio_path,
                 "-filter_complex", filter_str,
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "2",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
                 "-t", f"{duration:.3f}",
                 output_path
             ]
         else:
-            # Original native animation handling (no resize, no white padding)
-            filter_str = f"[0:v]{v_fade}[v];[1:a]{a_std},volume=1.20,alimiter=limit=0.97,{a_fade}[a]"
+            filter_str = f"[0:v]fps=30,format=yuv420p,setsar=1,{v_fade}[v];[1:a]{a_std},volume=1.20,alimiter=limit=0.97,{a_fade}[a]"
             cmd = [
                 "ffmpeg", "-y",
                 "-i", animation_video_path,
                 "-i", audio_path,
                 "-filter_complex", filter_str,
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "2",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
                 "-t", f"{duration:.3f}",
                 output_path
@@ -203,62 +201,73 @@ def render_individual_scene(
 
 def concat_all_scenes(scene_paths: list[str], final_output_path: str) -> str:
     """
-    Concatenates all scene MP4s without re-encoding if resolutions match.
-    If a video mixes resolutions (e.g., 1920x1080 Newspaper + native Bing Whiteboard),
-    cleanly scales to match the target resolution without white padding.
+    Low-memory concatenation safe for 60+ scenes on Streamlit Cloud:
+    1. Finds the dominant resolution among rendered scenes.
+    2. Normalizes ONLY mismatched scenes one-by-one (sequentially, ~150MB RAM).
+    3. Concatenates all scenes using FFmpeg concat demuxer (-c copy, ~20MB RAM).
     """
     if not scene_paths:
         raise ValueError("No rendered scene MP4s provided to concatenate.")
 
     os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
     dims = [_get_video_dimensions(p) for p in scene_paths]
-    all_same_dim = len(set(dims)) == 1
+    unique_dims = set(dims)
 
-    if all_same_dim:
-        concat_list_path = f"{final_output_path}.concat.txt"
-        with open(concat_list_path, "w", encoding="utf-8") as f:
-            for p in scene_paths:
-                f.write(f"file '{os.path.abspath(p)}'\n")
+    temp_normalized = []
+    final_inputs = []
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list_path,
-            "-c", "copy",
-            final_output_path
-        ]
-        run_command(cmd)
-        if os.path.exists(concat_list_path):
-            os.remove(concat_list_path)
+    if len(unique_dims) == 1:
+        final_inputs = [os.path.abspath(p) for p in scene_paths]
     else:
-        # Mixed resolutions (e.g. Newspaper 1920x1080 + Whiteboard native): use filter concat
-        target_w, target_h = dims[0]
-        if (1920, 1080) in dims:
-            target_w, target_h = 1920, 1080
+        # Pick the most common resolution so most scenes skip re-encoding completely
+        target_w, target_h = Counter(dims).most_common(1)[0][0]
+        logger.info(f"Normalizing {len(scene_paths)} scenes sequentially to {target_w}x{target_h}...")
 
-        inputs = []
-        filters = []
-        concat_streams = []
-        for idx, p in enumerate(scene_paths):
-            inputs.extend(["-i", os.path.abspath(p)])
-            filters.append(
-                f"[{idx}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},fps=30,format=yuv420p,setsar=1[v{idx}];"
-                f"[{idx}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{idx}]"
-            )
-            concat_streams.append(f"[v{idx}][a{idx}]")
+        for idx, (p, (w, h)) in enumerate(zip(scene_paths, dims)):
+            abs_p = os.path.abspath(p)
+            if (w, h) == (target_w, target_h):
+                final_inputs.append(abs_p)
+            else:
+                norm_p = f"{final_output_path}.norm_{idx:03d}.mp4"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", abs_p,
+                    "-vf", (
+                        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                        f"crop={target_w}:{target_h},fps=30,format=yuv420p,setsar=1"
+                    ),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-threads", "2",
+                    "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+                    norm_p,
+                ]
+                run_command(cmd)
+                temp_normalized.append(norm_p)
+                final_inputs.append(os.path.abspath(norm_p))
+                gc.collect()
 
-        filter_complex = ";".join(filters) + ";" + "".join(concat_streams) + f"concat=n={len(scene_paths)}:v=1:a=1[outv][outa]"
-        cmd = [
-            "ffmpeg", "-y",
-            *inputs,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-threads", "0",
-            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-            final_output_path
-        ]
-        run_command(cmd)
+    concat_list_path = f"{final_output_path}.concat.txt"
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for p in final_inputs:
+            f.write(f"file '{p}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_list_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        final_output_path
+    ]
+    run_command(cmd)
+
+    if os.path.exists(concat_list_path):
+        os.remove(concat_list_path)
+    for tp in temp_normalized:
+        if os.path.exists(tp):
+            try:
+                os.remove(tp)
+            except Exception:
+                pass
 
     logger.info(f"Final combined video assembled: {final_output_path}")
     return final_output_path
