@@ -30,6 +30,9 @@ from modules.ffmpeg_compositor import (
 from modules.whiteboard_text_math import generate_text_math_whiteboard
 from modules.whiteboard_image_anim import generate_native_whiteboard_animation
 
+# Newspaper Engine
+from modules.newspaper_anim import generate_newspaper_animation
+
 BG_DIR = "assets/backgrounds"
 OUTPUT_DIR = "outputs"
 CHECKPOINT_DIR = "storage/checkpoints"
@@ -53,10 +56,19 @@ ABSTRACT_AI_KEYWORDS = {
 }
 
 
-def compute_scene_hash(scene: dict, mode: str = "default") -> str:
+def compute_scene_hash(scene: dict, mode: str = "default", extra_key: str = "") -> str:
     """Produces a deterministic 12-character hash for cache verification."""
-    raw = f"{mode}_{scene.get('sentence', '')}_{scene.get('prompt', '')}_{scene.get('query', '')}_{scene.get('equation', '')}_{json.dumps(scene.get('headline', ''))}"
-    return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
+    raw = (
+        f"{mode}_{extra_key}_{scene.get('sentence', '')}_{scene.get('prompt', '')}_"
+        f"{scene.get('query', '')}_{scene.get('equation', '')}_"
+        f"{json.dumps(scene.get('headline', ''), ensure_ascii=False, sort_keys=True)}_"
+        f"{scene.get('subheadline', '')}_{scene.get('story_heading', '')}_"
+        f"{json.dumps(scene.get('yellow_highlights', []), ensure_ascii=False)}_"
+        f"{json.dumps(scene.get('body_paragraphs', []), ensure_ascii=False)}_"
+        f"{scene.get('newspaper', '')}_{scene.get('date_line', '')}_{scene.get('edition_info', '')}_"
+        f"{scene.get('duration', '')}"
+    )
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
 def is_valid_media_file(file_path: str, min_size_bytes: int = 5000) -> bool:
@@ -279,12 +291,14 @@ def process_video_pipeline(
     bing_cookie_u=None,
     voice_name: str = None,
     rest_seconds_between_scenes: int = 45,
-    pipeline_mode: str = "default",  # "default" or "whiteboard"
+    pipeline_mode: str = "default",  # "default", "whiteboard", or "newspaper"
     progress_callback=None,
-    artifact_callback=None
+    artifact_callback=None,
+    newspaper_options: dict = None,
 ) -> str:
     start_time = time.time()
     effective_cookie = bing_cookie or bing_cookie_u
+    newspaper_opts = newspaper_options or {}
 
     if not output_video_path:
         output_video_path = os.path.join(OUTPUT_DIR, f"master_video_{int(start_time)}.mp4")
@@ -303,16 +317,13 @@ def process_video_pipeline(
         i = 0
         while i < len(script_data):
             if i + 1 < len(script_data):
-                # Pair 2 sentences
                 s1 = script_data[i]
-                s2 = script_data[i+1]
+                s2 = script_data[i + 1]
                 combined_sentence = f"{s1.get('sentence', '').strip()} {s2.get('sentence', '').strip()}"
-                
-                # Check for equations (prefer s1, fallback to s2)
+
                 eq = s1.get("equation") or s2.get("equation") or ""
                 formula_title = s1.get("formula_name") or s2.get("formula_name") or s1.get("title") or s2.get("title") or ""
-                
-                # PREFER FIRST SENTENCE (s1) PROMPT & QUERY AS REQUESTED
+
                 combined_prompt = s1.get("prompt") or s2.get("prompt") or ""
                 combined_query = s1.get("query") or s2.get("query") or ""
 
@@ -328,7 +339,6 @@ def process_video_pipeline(
                 })
                 i += 2
             else:
-                # Odd remaining single sentence
                 s = script_data[i]
                 processed_units.append({
                     "sentence": s.get("sentence", "").strip(),
@@ -349,6 +359,7 @@ def process_video_pipeline(
     anim_cycle_idx = 0
     total_units = len(processed_units)
 
+    extra_hash_key = json.dumps(newspaper_opts, sort_keys=True, ensure_ascii=False) if pipeline_mode == "newspaper" else ""
     logger.info(f"Pipeline running {total_units} unit(s) in [{pipeline_mode.upper()}] mode.")
 
     def notify(msg: str):
@@ -361,7 +372,7 @@ def process_video_pipeline(
     for idx, unit in enumerate(processed_units):
         unit_num = idx + 1
         unit_prefix = f"unit_{unit_num:02d}_{unit['unit_id']}"
-        s_hash = compute_scene_hash(unit, mode=pipeline_mode)
+        s_hash = compute_scene_hash(unit, mode=pipeline_mode, extra_key=extra_hash_key)
 
         cached_mp4 = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_rendered.mp4")
 
@@ -379,20 +390,34 @@ def process_video_pipeline(
             except Exception:
                 pass
 
-        sentence = unit.get("sentence", "").strip()
+        sentence = str(unit.get("sentence", "")).strip()
+        # Allow Newspaper mode even if user supplied headline/body_paragraphs without 'sentence'
+        if not sentence and pipeline_mode == "newspaper":
+            hl = unit.get("headline", "")
+            if isinstance(hl, dict):
+                hl = " ".join(str(hl.get(k, "")) for k in ("prefix", "highlight", "suffix")).strip()
+            sentence = str(hl or unit.get("subheadline") or "").strip()
+            if not sentence and unit.get("body_paragraphs"):
+                bp = unit["body_paragraphs"]
+                sentence = str(bp[0] if isinstance(bp, list) else bp).strip()
         if not sentence:
             continue
 
-        # 2. Voiceover Generation
-        notify(f"Unit {unit_num}/{total_units}: Generating Voiceover ({pipeline_mode.title()})...")
-        audio_target = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_tts.wav")
-        if not is_valid_media_file(audio_target, 5000):
-            audio_path, duration = _execute_tts_with_retry(sentence, audio_target, voice_name=voice_name)
-        else:
-            audio_path, duration = audio_target, get_stream_duration(audio_target)
+        # 2. Voiceover Generation (Optional in Newspaper SFX-Only Mode)
+        use_tts = True if pipeline_mode != "newspaper" else bool(newspaper_opts.get("use_tts", True))
+        if use_tts:
+            notify(f"Unit {unit_num}/{total_units}: Generating Voiceover ({pipeline_mode.title()})...")
+            audio_target = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_tts.wav")
+            if not is_valid_media_file(audio_target, 5000):
+                audio_path, duration = _execute_tts_with_retry(sentence, audio_target, voice_name=voice_name)
+            else:
+                audio_path, duration = audio_target, get_stream_duration(audio_target)
 
-        if artifact_callback:
-            artifact_callback("audio", audio_path, f"🎤 Scene {unit_num} Audio ({duration:.1f}s)")
+            if artifact_callback:
+                artifact_callback("audio", audio_path, f"🎤 Scene {unit_num} Audio ({duration:.1f}s)")
+        else:
+            audio_path = None
+            duration = float(unit.get("duration") or newspaper_opts.get("sfx_only_duration", 8.0))
 
         rendered_scene_mp4 = cached_mp4
 
@@ -410,14 +435,11 @@ def process_video_pipeline(
                 if title:
                     blocks.append({"type": "heading", "text": title, "size": 56, "space_after": 18})
 
-                # First sentence
                 if unit.get("sentence_a"):
                     blocks.append({"type": "malayalam", "text": unit["sentence_a"], "size": 42, "space_after": 16})
 
-                # Math Formula
                 blocks.append({"type": "math", "latex": unit["equation"], "size": 32, "box": True, "space_after": 18})
 
-                # Second sentence underneath
                 if unit.get("sentence_b"):
                     blocks.append({"type": "malayalam", "text": unit["sentence_b"], "size": 40, "space_after": 14})
 
@@ -457,7 +479,6 @@ def process_video_pipeline(
                     fps=30
                 )
 
-            # Mux Whiteboard video with Cartesia audio and smooth fade
             render_individual_scene(
                 scene_type="animation",
                 audio_path=audio_path,
@@ -466,7 +487,53 @@ def process_video_pipeline(
             )
 
         # =============================================================
-        # DEFAULT MODE: Standard 1-Sentence Rhythm
+        # NEWSPAPER MODE: Symmetrical Drop, Highlights & Synced SFX
+        # =============================================================
+        elif pipeline_mode == "newspaper":
+            edition_choice = str(unit.get("newspaper") or newspaper_opts.get("edition") or "alternating").lower()
+            if edition_choice == "alternating":
+                paper_id = "manorama" if (idx % 2 == 0) else "mathrubhumi"
+            elif "mathru" in edition_choice:
+                paper_id = "mathrubhumi"
+            else:
+                paper_id = "manorama"
+
+            enable_sfx = bool(newspaper_opts.get("enable_sfx", True))
+            sfx_volume = float(newspaper_opts.get("sfx_volume", 0.45))
+
+            raw_news_silent = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_raw.mp4")
+            sfx_wav = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_sfx.wav") if enable_sfx else None
+
+            notify(f"Unit {unit_num}/{total_units}: Rendering {paper_id.title()} Newspaper ({duration:.1f}s)...")
+            generate_newspaper_animation(
+                unit=unit,
+                output_video_path=raw_news_silent,
+                output_sfx_wav_path=sfx_wav,
+                duration_sec=duration,
+                newspaper_id=paper_id,
+                table_path=newspaper_opts.get("table_path"),
+                defaults={
+                    "date_line": newspaper_opts.get("date_line", ""),
+                    "edition_info": newspaper_opts.get("edition_info", ""),
+                },
+                fps=30,
+            )
+
+            if artifact_callback and sfx_wav and os.path.exists(sfx_wav):
+                artifact_callback("audio", sfx_wav, f"🔊 Scene {unit_num} Newspaper SFX")
+
+            render_individual_scene(
+                scene_type="animation",
+                audio_path=audio_path,
+                output_path=rendered_scene_mp4,
+                animation_video_path=raw_news_silent,
+                sfx_audio_path=sfx_wav,
+                sfx_volume=sfx_volume,
+                fallback_duration=duration,
+            )
+
+        # =============================================================
+        # DEFAULT MODE: Standard 1-Sentence 3-Beat Rhythm
         # =============================================================
         else:
             scene_mode = idx % 3
