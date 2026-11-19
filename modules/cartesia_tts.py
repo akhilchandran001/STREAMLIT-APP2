@@ -9,7 +9,7 @@ import requests
 import websockets
 
 MODEL_ID = "sonic-3.6"
-DEFAULT_VOICE_NAME = "Shreeraj_HindiProfile"
+DEFAULT_VOICE_NAME = "Aniket_OdiaProfile"
 
 # Available voice profiles (Shreeraj set as first entry & default)
 VOICE_LIST = [
