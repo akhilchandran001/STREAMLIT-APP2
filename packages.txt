@@ -5,3 +5,5 @@ libgl1
 fonts-dejavu-core
 fonts-liberation
 libraqm0
+fonts-noto-core
+fonts-smc-chilanka
