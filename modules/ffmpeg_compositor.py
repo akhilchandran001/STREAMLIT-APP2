@@ -1,7 +1,8 @@
+import json
+import logging
 import os
 import subprocess
 import sys
-import logging
 from animations.type2_stamp_drop import render_animated_stamp_drop
 
 logger = logging.getLogger("VideoEngine.Compositor")
@@ -29,6 +30,23 @@ def get_stream_duration(file_path: str) -> float:
     return float(output)
 
 
+def _get_video_dimensions(file_path: str) -> tuple[int, int]:
+    """Returns (width, height) of the first video stream via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        file_path
+    ]
+    try:
+        out = run_command(cmd).strip().splitlines()[0]
+        w, h = out.split("x")
+        return int(w), int(h)
+    except Exception:
+        return (1920, 1080)
+
+
 def calculate_fade_times(duration: float, fade_len: float = 0.4) -> tuple[float, float]:
     """Standardizes to a 0.4-second fade-out at the scene boundary."""
     actual_fade = min(fade_len, duration / 2.0)
@@ -50,9 +68,10 @@ def render_individual_scene(
     fallback_duration: float = 8.0,
 ) -> str:
     """
-    Renders any scene into a standardized 1080p 30fps H.264/AAC MP4.
-    When both TTS audio and background SFX are present, sidechain ducking pushes
-    the SFX down whenever TTS speaks and keeps TTS voice clearly louder on top.
+    Renders any scene into a standardized MP4.
+    - Preserves native generated dimensions on `animation` (no white background padding).
+    - Mixes TTS + Newspaper SFX cleanly with gentle ducking so TTS is louder than SFX
+      while keeping paper drop & highlighter sounds clearly audible.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -70,14 +89,11 @@ def render_individual_scene(
     v_fade = f"fade=t=out:st={fade_start:.3f}:d={fade_len:.3f}"
     a_fade = f"afade=t=out:st={fade_start:.3f}:d={fade_len:.3f}"
 
-    # Standardized stereo audio format so concat_all_scenes (-c copy) never hits channel mismatches
     a_std = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
     temp_raw = f"{output_path}.raw.mp4"
 
     # SCENE TYPE 1: Unique Landscape Video (Scenes 1, 4...)
     if scene_type == "video":
-        if not has_tts:
-            raise ValueError("scene_type='video' requires a valid audio_path.")
         filter_str = (
             f"[0:v]scale=1920:1080:force_original_aspect_ratio=increase,"
             f"crop=1920:1080,fps=30,format=yuv420p,setsar=1,{v_fade}[v];"
@@ -98,8 +114,6 @@ def render_individual_scene(
 
     # SCENE TYPE 2: Animated Drop Stamp + Looping Background + Reference Typography
     elif scene_type == "background_with_image":
-        if not has_tts:
-            raise ValueError("scene_type='background_with_image' requires a valid audio_path.")
         render_animated_stamp_drop(
             bg_video_path=background_video_path,
             foreground_image_path=foreground_image_path,
@@ -127,23 +141,17 @@ def render_individual_scene(
         if os.path.exists(temp_raw):
             os.remove(temp_raw)
 
-    # SCENE TYPE 3: Procedural Kinetic Animation / Whiteboard / Newspaper
+    # SCENE TYPE 3: Whiteboard / Kinetic Animation / Newspaper (Native Dimensions Preserved!)
     elif scene_type == "animation":
-        v_norm = (
-            "scale=1920:1080:force_original_aspect_ratio=decrease,"
-            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=white,"
-            f"fps=30,format=yuv420p,setsar=1,{v_fade}[v]"
-        )
-
         if has_tts and has_sfx:
-            # Keep TTS voice clearly higher (1.40x) and aggressively duck SFX (20:1)
-            # whenever TTS is speaking so the two sounds do not clash/overlap.
-            clamped_sfx = max(0.0, min(0.35, float(sfx_volume) * 0.50))
+            # TTS at 1.35x; gentle sidechain ducking (ratio=3.5) keeps SFX audible
+            # without clashing over spoken words.
+            sfx_gain = max(0.0, min(0.75, float(sfx_volume) * 0.90))
             filter_str = (
-                f"[0:v]{v_norm};"
-                f"[1:a]{a_std},volume=1.40,apad,asplit=2[tts_mix][tts_sc];"
-                f"[2:a]{a_std},volume={clamped_sfx:.3f},apad[sfx_raw];"
-                f"[sfx_raw][tts_sc]sidechaincompress=threshold=0.015:ratio=20:attack=5:release=200:makeup=1[sfx_ducked];"
+                f"[0:v]format=yuv420p,{v_fade}[v];"
+                f"[1:a]{a_std},volume=1.35,apad,asplit=2[tts_mix][tts_sc];"
+                f"[2:a]{a_std},volume={sfx_gain:.3f},apad[sfx_raw];"
+                f"[sfx_raw][tts_sc]sidechaincompress=threshold=0.04:ratio=3.5:attack=10:release=160:makeup=1[sfx_ducked];"
                 f"[tts_mix][sfx_ducked]amerge=inputs=2,pan=stereo|c0=c0+c2|c1=c1+c3,"
                 f"alimiter=limit=0.97:attack=5:release=50,{a_fade}[a]"
             )
@@ -160,12 +168,8 @@ def render_individual_scene(
                 output_path
             ]
         elif has_sfx and not has_tts:
-            # SFX-Only Mode (No TTS voiceover)
-            clamped_sfx = max(0.0, min(1.0, float(sfx_volume) if sfx_volume > 0 else 0.85))
-            filter_str = (
-                f"[0:v]{v_norm};"
-                f"[1:a]{a_std},volume={clamped_sfx:.3f},alimiter=limit=0.97,{a_fade}[a]"
-            )
+            sfx_gain = max(0.0, min(1.0, float(sfx_volume) if sfx_volume > 0 else 0.85))
+            filter_str = f"[0:v]format=yuv420p,{v_fade}[v];[1:a]{a_std},volume={sfx_gain:.3f},alimiter=limit=0.97,{a_fade}[a]"
             cmd = [
                 "ffmpeg", "-y",
                 "-i", animation_video_path,
@@ -177,12 +181,9 @@ def render_individual_scene(
                 "-t", f"{duration:.3f}",
                 output_path
             ]
-        elif has_tts:
-            # Standard TTS-Only Animation
-            filter_str = (
-                f"[0:v]{v_norm};"
-                f"[1:a]{a_std},volume=1.20,alimiter=limit=0.97,{a_fade}[a]"
-            )
+        else:
+            # Original native animation handling (no resize, no white padding)
+            filter_str = f"[0:v]{v_fade}[v];[1:a]{a_std},volume=1.20,alimiter=limit=0.97,{a_fade}[a]"
             cmd = [
                 "ffmpeg", "-y",
                 "-i", animation_video_path,
@@ -194,55 +195,70 @@ def render_individual_scene(
                 "-t", f"{duration:.3f}",
                 output_path
             ]
-        else:
-            # Silent Animation fallback (generates silent stereo track so concat never breaks)
-            filter_str = (
-                f"[0:v]{v_norm};"
-                f"anullsrc=channel_layout=stereo:sample_rate=44100,{a_fade}[a]"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", animation_video_path,
-                "-filter_complex", filter_str,
-                "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "0",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-t", f"{duration:.3f}",
-                output_path
-            ]
-
         run_command(cmd)
-
-    else:
-        raise ValueError(f"Unsupported scene_type: '{scene_type}'")
 
     logger.info(f"Scene successfully rendered: {output_path} ({duration:.2f}s)")
     return output_path
 
 
 def concat_all_scenes(scene_paths: list[str], final_output_path: str) -> str:
-    """Concatenates all scene MP4s using FFmpeg concat demuxer without re-encoding."""
+    """
+    Concatenates all scene MP4s without re-encoding if resolutions match.
+    If a video mixes resolutions (e.g., 1920x1080 Newspaper + native Bing Whiteboard),
+    cleanly scales to match the target resolution without white padding.
+    """
     if not scene_paths:
         raise ValueError("No rendered scene MP4s provided to concatenate.")
 
     os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
-    concat_list_path = f"{final_output_path}.concat.txt"
+    dims = [_get_video_dimensions(p) for p in scene_paths]
+    all_same_dim = len(set(dims)) == 1
 
-    with open(concat_list_path, "w", encoding="utf-8") as f:
-        for p in scene_paths:
-            f.write(f"file '{os.path.abspath(p)}'\n")
+    if all_same_dim:
+        concat_list_path = f"{final_output_path}.concat.txt"
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            for p in scene_paths:
+                f.write(f"file '{os.path.abspath(p)}'\n")
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list_path,
-        "-c", "copy",
-        final_output_path
-    ]
-    run_command(cmd)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            final_output_path
+        ]
+        run_command(cmd)
+        if os.path.exists(concat_list_path):
+            os.remove(concat_list_path)
+    else:
+        # Mixed resolutions (e.g. Newspaper 1920x1080 + Whiteboard native): use filter concat
+        target_w, target_h = dims[0]
+        if (1920, 1080) in dims:
+            target_w, target_h = 1920, 1080
 
-    if os.path.exists(concat_list_path):
-        os.remove(concat_list_path)
+        inputs = []
+        filters = []
+        concat_streams = []
+        for idx, p in enumerate(scene_paths):
+            inputs.extend(["-i", os.path.abspath(p)])
+            filters.append(
+                f"[{idx}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{target_h},fps=30,format=yuv420p,setsar=1[v{idx}];"
+                f"[{idx}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{idx}]"
+            )
+            concat_streams.append(f"[v{idx}][a{idx}]")
+
+        filter_complex = ";".join(filters) + ";" + "".join(concat_streams) + f"concat=n={len(scene_paths)}:v=1:a=1[outv][outa]"
+        cmd = [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-threads", "0",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+            final_output_path
+        ]
+        run_command(cmd)
 
     logger.info(f"Final combined video assembled: {final_output_path}")
     return final_output_path
