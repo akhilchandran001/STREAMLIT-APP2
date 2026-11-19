@@ -12,16 +12,18 @@ from modules.text_parser import parse_input_script
 
 logger = logging.getLogger("VideoEngine.TelegramHandler")
 
-# Temporary cache mapping user_id -> parsed script data
+# Temporary cache mapping job_key -> parsed script data
 PENDING_JOBS = {}
 
 START_MESSAGE = (
     "🎬 **Welcome to the Automated Video Engine Studio!**\n\n"
     "Send me a `.json` or `.txt` file, or paste your script text.\n\n"
-    "⚙️ **Two Generation Modes:**\n"
+    "⚙️ **Three Generation Modes:**\n"
     "1️⃣ **Default 3-Beat Rhythm:** Stock landscape video + stamp card + procedural kinetic animation.\n"
-    "2️⃣ **Whiteboard Animation:** Pure hand-drawn animation with living hand physics, math LaTeX equations, and vector sketching (driven by Cartesia TTS durations and Bing image generation).\n"
+    "2️⃣ **Whiteboard Animation:** Pure hand-drawn animation with living hand physics, math LaTeX equations, and vector sketching.\n"
+    "3️⃣ **Newspaper Animation:** Symmetrical newspaper drop onto wooden table, yellow marker highlights, red underlines, and synced paper/marker SFX.\n"
 )
+
 
 def get_bing_cookies():
     try:
@@ -34,6 +36,7 @@ def get_bing_cookies():
         pass
     return os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
 
+
 async def safe_edit_message(message: Message, text: str):
     for attempt in range(3):
         try:
@@ -44,16 +47,20 @@ async def safe_edit_message(message: Message, text: str):
         except Exception:
             break
 
+
 async def prompt_user_mode_selection(client: Client, message: Message, script_data: list):
-    """Presents the two interactive buttons to the user before starting."""
+    """Presents the three interactive mode buttons to the user before starting."""
     user_id = message.from_user.id
     job_key = f"{user_id}_{int(time.time())}"
     PENDING_JOBS[job_key] = script_data
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎬 Default Pipeline (Normal)", callback_data=f"mode:default:{job_key}"),
-            InlineKeyboardButton("✍️ Whiteboard Animation", callback_data=f"mode:whiteboard:{job_key}")
+            InlineKeyboardButton("🎬 Default Pipeline", callback_data=f"mode:default:{job_key}"),
+            InlineKeyboardButton("✍️ Whiteboard", callback_data=f"mode:whiteboard:{job_key}")
+        ],
+        [
+            InlineKeyboardButton("📰 Newspaper Animation", callback_data=f"mode:newspaper:{job_key}")
         ]
     ])
 
@@ -62,6 +69,7 @@ async def prompt_user_mode_selection(client: Client, message: Message, script_da
         "Please choose your preferred animation engine:",
         reply_markup=keyboard
     )
+
 
 async def execute_pipeline_for_user(client: Client, message: Message, script_data: list, mode: str):
     chat_id = message.chat.id
@@ -112,6 +120,13 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
         except Exception as e:
             logger.error(f"Upload failed: {e}")
 
+    newspaper_options = {
+        "edition": "alternating",
+        "enable_sfx": True,
+        "sfx_volume": 0.45,
+        "use_tts": True,
+    }
+
     try:
         await loop.run_in_executor(
             None,
@@ -121,7 +136,8 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
                 bing_cookie=bing_cookies,
                 pipeline_mode=mode,
                 progress_callback=progress_callback,
-                artifact_callback=artifact_callback
+                artifact_callback=artifact_callback,
+                newspaper_options=newspaper_options
             )
         )
         completion_text = (
@@ -135,6 +151,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
         logger.exception("Pipeline execution failed")
         await safe_edit_message(status_msg, f"❌ Execution Failed:\n`{str(e)}`")
 
+
 # =====================================================================
 # PYROGRAM HANDLERS
 # =====================================================================
@@ -142,6 +159,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
 @Client.on_message(filters.command("start") & filters.private)
 async def handle_start_command(client: Client, message: Message):
     await message.reply_text(START_MESSAGE, disable_web_page_preview=True)
+
 
 @Client.on_message(filters.document & filters.private)
 async def handle_document_upload(client: Client, message: Message):
@@ -162,6 +180,7 @@ async def handle_document_upload(client: Client, message: Message):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
 @Client.on_message(filters.text & filters.private)
 async def handle_raw_text(client: Client, message: Message):
     text = message.text.strip()
@@ -174,12 +193,13 @@ async def handle_raw_text(client: Client, message: Message):
     except Exception as err:
         await message.reply_text(f"❌ Error parsing script text:\n`{str(err)}`")
 
-@Client.on_callback_query(filters.regex(r"^mode:(default|whiteboard):(.+)$"))
+
+@Client.on_callback_query(filters.regex(r"^mode:(default|whiteboard|newspaper):(.+)$"))
 async def handle_mode_callback(client: Client, callback: CallbackQuery):
     mode = callback.matches[0].group(1)
     job_key = callback.matches[0].group(2)
 
-    script_data = PENDING_JOBS.get(job_key)
+    script_data = PENDING_JOBS.pop(job_key, None)
     if not script_data:
         await callback.answer("⚠️ Session expired. Please re-send your script.", show_alert=True)
         return
