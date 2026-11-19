@@ -12,16 +12,14 @@ from modules.text_parser import parse_input_script
 
 logger = logging.getLogger("VideoEngine.TelegramHandler")
 
-# Temporary cache mapping job_key -> parsed script data
 PENDING_JOBS = {}
 
 START_MESSAGE = (
     "🎬 **Welcome to the Automated Video Engine Studio!**\n\n"
     "Send me a `.json` or `.txt` file, or paste your script text.\n\n"
-    "⚙️ **Three Generation Modes:**\n"
-    "1️⃣ **Default 3-Beat Rhythm:** Stock landscape video + stamp card + procedural kinetic animation.\n"
-    "2️⃣ **Whiteboard Animation:** Pure hand-drawn animation with living hand physics, math LaTeX equations, and vector sketching.\n"
-    "3️⃣ **Newspaper Animation:** Symmetrical newspaper drop onto wooden table, yellow marker highlights, red underlines, and synced paper/marker SFX.\n"
+    "⚙️ **Two Generation Modes:**\n"
+    "1️⃣ **Default (Normal):** Stock landscape video + stamp card + procedural kinetic animation (plus Newspaper scenes when specified in JSON).\n"
+    "2️⃣ **Whiteboard Animation:** 2 sentences per visual — hand-drawn stick-figure/vector sketching, math LaTeX, or Newspaper animation when specified in JSON.\n"
 )
 
 
@@ -49,18 +47,15 @@ async def safe_edit_message(message: Message, text: str):
 
 
 async def prompt_user_mode_selection(client: Client, message: Message, script_data: list):
-    """Presents the three interactive mode buttons to the user before starting."""
+    """Presents the two interactive mode buttons to the user before starting."""
     user_id = message.from_user.id
     job_key = f"{user_id}_{int(time.time())}"
     PENDING_JOBS[job_key] = script_data
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎬 Default Pipeline", callback_data=f"mode:default:{job_key}"),
-            InlineKeyboardButton("✍️ Whiteboard", callback_data=f"mode:whiteboard:{job_key}")
-        ],
-        [
-            InlineKeyboardButton("📰 Newspaper Animation", callback_data=f"mode:newspaper:{job_key}")
+            InlineKeyboardButton("🎬 Default Pipeline (Normal)", callback_data=f"mode:default:{job_key}"),
+            InlineKeyboardButton("✍️ Whiteboard Animation", callback_data=f"mode:whiteboard:{job_key}")
         ]
     ])
 
@@ -152,10 +147,6 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
         await safe_edit_message(status_msg, f"❌ Execution Failed:\n`{str(e)}`")
 
 
-# =====================================================================
-# PYROGRAM HANDLERS
-# =====================================================================
-
 @Client.on_message(filters.command("start") & filters.private)
 async def handle_start_command(client: Client, message: Message):
     await message.reply_text(START_MESSAGE, disable_web_page_preview=True)
@@ -194,7 +185,7 @@ async def handle_raw_text(client: Client, message: Message):
         await message.reply_text(f"❌ Error parsing script text:\n`{str(err)}`")
 
 
-@Client.on_callback_query(filters.regex(r"^mode:(default|whiteboard|newspaper):(.+)$"))
+@Client.on_callback_query(filters.regex(r"^mode:(default|whiteboard):(.+)$"))
 async def handle_mode_callback(client: Client, callback: CallbackQuery):
     mode = callback.matches[0].group(1)
     job_key = callback.matches[0].group(2)
