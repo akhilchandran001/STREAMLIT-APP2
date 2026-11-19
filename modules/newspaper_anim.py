@@ -52,7 +52,12 @@ def resolve_logo_path(newspaper_id: str) -> str | None:
             "manorama.jpg",
         ]
     for name in names:
-        for base in (LOGOS_DIR, NEWSPAPER_ASSETS_DIR, os.path.join(REPO_ROOT, "assets")):
+        for base in (
+            LOGOS_DIR,
+            os.path.join(REPO_ROOT, "assets", "logos"),
+            NEWSPAPER_ASSETS_DIR,
+            os.path.join(REPO_ROOT, "assets"),
+        ):
             p = os.path.join(base, name)
             if os.path.exists(p):
                 return p
