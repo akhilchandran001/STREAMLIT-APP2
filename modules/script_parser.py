@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 from modules.cartesia_tts import generate_speech
 from modules.pixabay_fetcher import fetch_landscape_video, fetch_image
-from modules.bing_fetcher import run_sync_generate
+from modules.bing_fetcher import run_sync_generate, parse_cookie_pool
 from animations.animation_router import render_animation_by_index
 from modules.ffmpeg_compositor import (
     render_individual_scene,
@@ -30,7 +30,7 @@ from modules.ffmpeg_compositor import (
 from modules.whiteboard_text_math import generate_text_math_whiteboard
 from modules.whiteboard_image_anim import generate_native_whiteboard_animation
 
-# Newspaper Engine
+# Newspaper Engine (usable inside both Default & Whiteboard modes when JSON specifies it)
 from modules.newspaper_anim import generate_newspaper_animation
 
 BG_DIR = "assets/backgrounds"
@@ -52,8 +52,21 @@ ABSTRACT_AI_KEYWORDS = {
     "quantum", "subatomic", "particle", "ghost", "neutrino", "matrix", "cyber",
     "futuristic", "citadel", "portal", "dimension", "black hole", "singularity",
     "supernova", "cosmic energy", "abstract", "alien", "energy silhouette",
-    "glowing energy", "laser burst", "cosmic rays", "accretion disk"
+    "glowing energy", "laser burst", "cosmic rays", "accretion disk",
+    "stick figure", "doodle", "line art", "whiteboard", "sketch"
 }
+
+
+def is_newspaper_scene(scene: dict) -> bool:
+    """Detects whether a scene (or odd leader sentence in WB mode) requests Newspaper animation."""
+    scene_type = str(scene.get("type") or scene.get("visual_type") or scene.get("animation") or "").lower().strip()
+    if scene_type == "newspaper":
+        return True
+    if scene.get("newspaper"):
+        return True
+    if scene.get("body_paragraphs") or scene.get("yellow_highlights"):
+        return True
+    return False
 
 
 def compute_scene_hash(scene: dict, mode: str = "default", extra_key: str = "") -> str:
@@ -61,17 +74,19 @@ def compute_scene_hash(scene: dict, mode: str = "default", extra_key: str = "") 
     raw = (
         f"{mode}_{extra_key}_{scene.get('sentence', '')}_{scene.get('prompt', '')}_"
         f"{scene.get('query', '')}_{scene.get('equation', '')}_"
+        f"{scene.get('type', '')}_{scene.get('newspaper', '')}_"
         f"{json.dumps(scene.get('headline', ''), ensure_ascii=False, sort_keys=True)}_"
         f"{scene.get('subheadline', '')}_{scene.get('story_heading', '')}_"
         f"{json.dumps(scene.get('yellow_highlights', []), ensure_ascii=False)}_"
         f"{json.dumps(scene.get('body_paragraphs', []), ensure_ascii=False)}_"
-        f"{scene.get('newspaper', '')}_{scene.get('date_line', '')}_{scene.get('edition_info', '')}_"
-        f"{scene.get('duration', '')}"
+        f"{scene.get('date_line', '')}_{scene.get('edition_info', '')}"
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
 def is_valid_media_file(file_path: str, min_size_bytes: int = 5000) -> bool:
+    if os.path.exists(f"{file_path}.fallback"):
+        return False
     return os.path.exists(file_path) and os.path.getsize(file_path) >= min_size_bytes
 
 
@@ -224,14 +239,38 @@ def generate_emergency_fallback_image(output_path: str):
     cv2.rectangle(canvas, (120, 100), (1800, 980), (30, 30, 30), 4)
     cv2.circle(canvas, (w // 2, h // 2), 220, (50, 50, 50), 3)
     cv2.imwrite(output_path, canvas)
+    # Mark as fallback so next run retries Bing/Wikimedia instead of reusing blank fallback
+    with open(f"{output_path}.fallback", "w") as f:
+        f.write("fallback")
 
 
-def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
+def acquire_scene_image(
+    scene: dict,
+    raw_img_path: str,
+    bing_cookies,
+    force_bing: bool = False,
+    status_cb=None
+) -> tuple[str, str]:
+    """
+    Acquires scene visual and returns (image_path, source_status_label).
+    """
+    def _emit(msg: str):
+        logger.info(msg)
+        if status_cb:
+            status_cb(msg)
+
+    fallback_marker = f"{raw_img_path}.fallback"
+    if os.path.exists(fallback_marker):
+        try:
+            os.remove(fallback_marker)
+        except Exception:
+            pass
+
     if "equation" in scene and str(scene.get("equation", "")).strip():
         formula_latex = str(scene["equation"]).strip()
         formula_name = str(scene.get("formula_name") or scene.get("title") or "").strip()
         render_cinematic_equation_card(formula_latex, raw_img_path, formula_name=formula_name)
-        return raw_img_path
+        return raw_img_path, "LaTeX Equation Card"
 
     explicit = str(scene.get("image_source") or scene.get("source") or "").lower().strip()
     prompt_text = scene.get("prompt", "").strip()
@@ -239,40 +278,53 @@ def acquire_scene_image(scene: dict, raw_img_path: str, bing_cookies) -> str:
     search_q = query_text or prompt_text
 
     combined_text = f"{prompt_text.lower()} {query_text.lower()}"
-    prefer_ai = explicit in ["bing", "ai", "dall-e"] or any(k in combined_text for k in ABSTRACT_AI_KEYWORDS)
+    prefer_ai = force_bing or explicit in ["bing", "ai", "dall-e"] or any(k in combined_text for k in ABSTRACT_AI_KEYWORDS)
+    cookies_list = parse_cookie_pool(bing_cookies)
+    bing_error = ""
 
     if prefer_ai and prompt_text:
-        try:
-            run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
-            if is_valid_media_file(raw_img_path):
-                return raw_img_path
-        except Exception:
-            pass
+        if cookies_list:
+            _emit(f"🎨 Bing AI generating ({len(cookies_list)} cookie(s) ready)...")
+            try:
+                run_sync_generate(prompt_text, raw_img_path, cookie_u=cookies_list)
+                if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) >= 5000:
+                    _emit("✅ Bing AI image generated successfully!")
+                    return raw_img_path, "Bing AI ✅"
+                bing_error = "Bing returned empty/small file"
+            except Exception as e:
+                bing_error = str(e)
+                _emit(f"❌ Bing AI failed: {bing_error[:120]}")
+        else:
+            bing_error = "No Bing _U cookies configured"
+            _emit(f"⚠️ {bing_error}. Trying Wikimedia...")
 
         try:
             fetch_image(search_q, raw_img_path)
-            if is_valid_media_file(raw_img_path):
-                return raw_img_path
-        except Exception:
-            pass
+            if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) >= 5000:
+                return raw_img_path, f"Wikimedia Fallback (Bing: {bing_error[:60]})"
+        except Exception as we:
+            _emit(f"⚠️ Wikimedia fallback failed: {str(we)[:100]}")
     else:
         try:
             fetch_image(search_q, raw_img_path)
-            if is_valid_media_file(raw_img_path):
-                return raw_img_path
+            if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) >= 5000:
+                return raw_img_path, "Wikimedia ✅"
         except Exception:
             pass
 
-        if prompt_text:
+        if prompt_text and cookies_list:
+            _emit(f"🎨 Bing AI generating ({len(cookies_list)} cookie(s) ready)...")
             try:
-                run_sync_generate(prompt_text, raw_img_path, cookie_u=bing_cookies)
-                if is_valid_media_file(raw_img_path):
-                    return raw_img_path
-            except Exception:
-                pass
+                run_sync_generate(prompt_text, raw_img_path, cookie_u=cookies_list)
+                if os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) >= 5000:
+                    _emit("✅ Bing AI image generated successfully!")
+                    return raw_img_path, "Bing AI ✅"
+            except Exception as e:
+                bing_error = str(e)
+                _emit(f"❌ Bing AI failed: {bing_error[:120]}")
 
     generate_emergency_fallback_image(raw_img_path)
-    return raw_img_path
+    return raw_img_path, f"⚠️ Emergency Fallback ({bing_error[:80] or 'No media found'})"
 
 
 def get_available_backgrounds(assets_dir: str = BG_DIR) -> list[str]:
@@ -283,6 +335,63 @@ def get_available_backgrounds(assets_dir: str = BG_DIR) -> list[str]:
     return sorted(files)
 
 
+def _render_newspaper_unit(
+    unit: dict,
+    idx: int,
+    unit_num: int,
+    total_units: int,
+    unit_prefix: str,
+    s_hash: str,
+    audio_path: str | None,
+    duration: float,
+    rendered_scene_mp4: str,
+    newspaper_opts: dict,
+    notify,
+    artifact_callback,
+):
+    edition_choice = str(unit.get("newspaper") or newspaper_opts.get("edition") or "alternating").lower()
+    if edition_choice in ("true", "1", "yes", "alternating"):
+        paper_id = "manorama" if (idx % 2 == 0) else "mathrubhumi"
+    elif "mathru" in edition_choice:
+        paper_id = "mathrubhumi"
+    else:
+        paper_id = "manorama"
+
+    enable_sfx = bool(newspaper_opts.get("enable_sfx", True))
+    sfx_volume = float(newspaper_opts.get("sfx_volume", 0.45))
+
+    raw_news_silent = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_raw.mp4")
+    sfx_wav = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_sfx.wav") if enable_sfx else None
+
+    notify(f"Unit {unit_num}/{total_units}: Rendering 📰 {paper_id.title()} Newspaper ({duration:.1f}s)...")
+    generate_newspaper_animation(
+        unit=unit,
+        output_video_path=raw_news_silent,
+        output_sfx_wav_path=sfx_wav,
+        duration_sec=duration,
+        newspaper_id=paper_id,
+        table_path=newspaper_opts.get("table_path"),
+        defaults={
+            "date_line": newspaper_opts.get("date_line", ""),
+            "edition_info": newspaper_opts.get("edition_info", ""),
+        },
+        fps=30,
+    )
+
+    if artifact_callback and sfx_wav and os.path.exists(sfx_wav):
+        artifact_callback("audio", sfx_wav, f"🔊 Scene {unit_num} Newspaper SFX")
+
+    render_individual_scene(
+        scene_type="animation",
+        audio_path=audio_path,
+        output_path=rendered_scene_mp4,
+        animation_video_path=raw_news_silent,
+        sfx_audio_path=sfx_wav,
+        sfx_volume=sfx_volume,
+        fallback_duration=duration,
+    )
+
+
 def process_video_pipeline(
     script_data: list[dict],
     output_video_path: str = None,
@@ -291,13 +400,14 @@ def process_video_pipeline(
     bing_cookie_u=None,
     voice_name: str = None,
     rest_seconds_between_scenes: int = 45,
-    pipeline_mode: str = "default",  # "default", "whiteboard", or "newspaper"
+    pipeline_mode: str = "default",  # "default" or "whiteboard"
     progress_callback=None,
     artifact_callback=None,
     newspaper_options: dict = None,
 ) -> str:
     start_time = time.time()
     effective_cookie = bing_cookie or bing_cookie_u
+    cookies_pool = parse_cookie_pool(effective_cookie)
     newspaper_opts = newspaper_options or {}
 
     if not output_video_path:
@@ -311,23 +421,36 @@ def process_video_pipeline(
         if not available_bgs:
             raise RuntimeError(f"No background videos found in '{BG_DIR}/'.")
 
-    # In Whiteboard mode, group scenes into 2-sentence pairs
+    def notify(msg: str):
+        logger.info(msg)
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
+
+    if cookies_pool:
+        notify(f"🔑 Bing Cookies Loaded: {len(cookies_pool)} cookie(s) active")
+    else:
+        notify("⚠️ WARNING: No Bing _U cookies found! Image generation will fall back to Wikimedia.")
+
+    # In Whiteboard mode, group scenes into 2-sentence pairs (odd sentence 1, 3, 5... leads the pair)
     if pipeline_mode == "whiteboard":
         processed_units = []
         i = 0
         while i < len(script_data):
             if i + 1 < len(script_data):
-                s1 = script_data[i]
-                s2 = script_data[i + 1]
-                combined_sentence = f"{s1.get('sentence', '').strip()} {s2.get('sentence', '').strip()}"
+                s1 = script_data[i]      # Odd sentence (1, 3, 5...)
+                s2 = script_data[i + 1]  # Even sentence (2, 4, 6...)
+                combined_sentence = f"{s1.get('sentence', '').strip()} {s2.get('sentence', '').strip()}".strip()
 
                 eq = s1.get("equation") or s2.get("equation") or ""
                 formula_title = s1.get("formula_name") or s2.get("formula_name") or s1.get("title") or s2.get("title") or ""
-
                 combined_prompt = s1.get("prompt") or s2.get("prompt") or ""
                 combined_query = s1.get("query") or s2.get("query") or ""
 
-                processed_units.append({
+                # Odd sentence (s1) controls whether the 2-sentence unit is a Newspaper scene
+                pair_unit = {
                     "sentence": combined_sentence,
                     "sentence_a": s1.get("sentence", "").strip(),
                     "sentence_b": s2.get("sentence", "").strip(),
@@ -335,21 +458,29 @@ def process_video_pipeline(
                     "formula_name": formula_title,
                     "prompt": combined_prompt,
                     "query": combined_query,
+                    "source": s1.get("source") or s2.get("source") or "",
+                    "type": s1.get("type") or "",
+                    "visual_type": s1.get("visual_type") or "",
+                    "animation": s1.get("animation") or "",
+                    "newspaper": s1.get("newspaper") or "",
+                    "headline": s1.get("headline") or "",
+                    "subheadline": s1.get("subheadline") or "",
+                    "yellow_highlights": s1.get("yellow_highlights") or [],
+                    "story_heading": s1.get("story_heading") or "",
+                    "body_paragraphs": s1.get("body_paragraphs") or [],
+                    "date_line": s1.get("date_line") or "",
+                    "edition_info": s1.get("edition_info") or "",
                     "unit_id": f"pair_{i+1}_{i+2}"
-                })
+                }
+                processed_units.append(pair_unit)
                 i += 2
             else:
-                s = script_data[i]
-                processed_units.append({
-                    "sentence": s.get("sentence", "").strip(),
-                    "sentence_a": s.get("sentence", "").strip(),
-                    "sentence_b": "",
-                    "equation": s.get("equation", ""),
-                    "formula_name": s.get("formula_name", ""),
-                    "prompt": s.get("prompt", ""),
-                    "query": s.get("query", ""),
-                    "unit_id": f"single_{i+1}"
-                })
+                s = dict(script_data[i])
+                s["sentence"] = s.get("sentence", "").strip()
+                s["sentence_a"] = s["sentence"]
+                s["sentence_b"] = ""
+                s["unit_id"] = f"single_{i+1}"
+                processed_units.append(s)
                 i += 1
     else:
         processed_units = [dict(s, unit_id=f"scene_{idx+1}") for idx, s in enumerate(script_data)]
@@ -359,74 +490,80 @@ def process_video_pipeline(
     anim_cycle_idx = 0
     total_units = len(processed_units)
 
-    extra_hash_key = json.dumps(newspaper_opts, sort_keys=True, ensure_ascii=False) if pipeline_mode == "newspaper" else ""
     logger.info(f"Pipeline running {total_units} unit(s) in [{pipeline_mode.upper()}] mode.")
-
-    def notify(msg: str):
-        if progress_callback:
-            try:
-                progress_callback(msg)
-            except Exception:
-                pass
 
     for idx, unit in enumerate(processed_units):
         unit_num = idx + 1
         unit_prefix = f"unit_{unit_num:02d}_{unit['unit_id']}"
-        s_hash = compute_scene_hash(unit, mode=pipeline_mode, extra_key=extra_hash_key)
+        is_news = is_newspaper_scene(unit)
+        extra_key = json.dumps(newspaper_opts, sort_keys=True, ensure_ascii=False) if is_news else ""
+        s_hash = compute_scene_hash(unit, mode=pipeline_mode, extra_key=extra_key)
 
         cached_mp4 = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_rendered.mp4")
 
-        # 1. Checkpoint Verification
-        if is_valid_video_file(cached_mp4, 50000):
-            logger.info(f"[{unit_prefix}] Reusing cached render...")
+        # 1. Checkpoint Verification (skip cache if a fallback marker exists)
+        fallback_flag = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_used_fallback")
+        if is_valid_video_file(cached_mp4, 50000) and not os.path.exists(fallback_flag):
             notify(f"Unit {unit_num}/{total_units}: Reusing completed cache...")
             if artifact_callback:
                 artifact_callback("video", cached_mp4, f"🎬 Scene {unit_num} (Cached)")
             scene_video_paths.append(cached_mp4)
             continue
-        elif os.path.exists(cached_mp4):
-            try:
-                os.remove(cached_mp4)
-            except Exception:
-                pass
+        else:
+            for p in (cached_mp4, fallback_flag):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
         sentence = str(unit.get("sentence", "")).strip()
-        # Allow Newspaper mode even if user supplied headline/body_paragraphs without 'sentence'
-        if not sentence and pipeline_mode == "newspaper":
+        if not sentence and is_news:
             hl = unit.get("headline", "")
             if isinstance(hl, dict):
                 hl = " ".join(str(hl.get(k, "")) for k in ("prefix", "highlight", "suffix")).strip()
             sentence = str(hl or unit.get("subheadline") or "").strip()
-            if not sentence and unit.get("body_paragraphs"):
-                bp = unit["body_paragraphs"]
-                sentence = str(bp[0] if isinstance(bp, list) else bp).strip()
         if not sentence:
             continue
 
-        # 2. Voiceover Generation (Optional in Newspaper SFX-Only Mode)
-        use_tts = True if pipeline_mode != "newspaper" else bool(newspaper_opts.get("use_tts", True))
-        if use_tts:
-            notify(f"Unit {unit_num}/{total_units}: Generating Voiceover ({pipeline_mode.title()})...")
-            audio_target = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_tts.wav")
-            if not is_valid_media_file(audio_target, 5000):
-                audio_path, duration = _execute_tts_with_retry(sentence, audio_target, voice_name=voice_name)
-            else:
-                audio_path, duration = audio_target, get_stream_duration(audio_target)
-
-            if artifact_callback:
-                artifact_callback("audio", audio_path, f"🎤 Scene {unit_num} Audio ({duration:.1f}s)")
+        # 2. Voiceover Generation
+        notify(f"Unit {unit_num}/{total_units}: Generating Cartesia TTS...")
+        audio_target = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_tts.wav")
+        if not is_valid_media_file(audio_target, 5000):
+            audio_path, duration = _execute_tts_with_retry(sentence, audio_target, voice_name=voice_name)
         else:
-            audio_path = None
-            duration = float(unit.get("duration") or newspaper_opts.get("sfx_only_duration", 8.0))
+            audio_path, duration = audio_target, get_stream_duration(audio_target)
+
+        if artifact_callback:
+            artifact_callback("audio", audio_path, f"🎤 Scene {unit_num} Audio ({duration:.1f}s)")
 
         rendered_scene_mp4 = cached_mp4
 
         # =============================================================
+        # PER-SCENE NEWSPAPER (Works inside BOTH Default & Whiteboard)
+        # =============================================================
+        if is_news:
+            _render_newspaper_unit(
+                unit=unit,
+                idx=idx,
+                unit_num=unit_num,
+                total_units=total_units,
+                unit_prefix=unit_prefix,
+                s_hash=s_hash,
+                audio_path=audio_path,
+                duration=duration,
+                rendered_scene_mp4=rendered_scene_mp4,
+                newspaper_opts=newspaper_opts,
+                notify=notify,
+                artifact_callback=artifact_callback,
+            )
+
+        # =============================================================
         # WHITEBOARD MODE: 2-Sentence Cohesive Hand-Drawing
         # =============================================================
-        if pipeline_mode == "whiteboard":
+        elif pipeline_mode == "whiteboard":
             raw_wb_silent = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_wb_raw.mp4")
-            has_eq = bool(unit.get("equation", "").strip())
+            has_eq = bool(str(unit.get("equation", "")).strip())
 
             if has_eq:
                 notify(f"Unit {unit_num}/{total_units}: Drawing 2-Sentence Math Whiteboard ({duration:.1f}s)...")
@@ -434,12 +571,9 @@ def process_video_pipeline(
                 title = unit.get("formula_name") or unit.get("title") or ""
                 if title:
                     blocks.append({"type": "heading", "text": title, "size": 56, "space_after": 18})
-
                 if unit.get("sentence_a"):
                     blocks.append({"type": "malayalam", "text": unit["sentence_a"], "size": 42, "space_after": 16})
-
                 blocks.append({"type": "math", "latex": unit["equation"], "size": 32, "box": True, "space_after": 18})
-
                 if unit.get("sentence_b"):
                     blocks.append({"type": "malayalam", "text": unit["sentence_b"], "size": 40, "space_after": 14})
 
@@ -450,28 +584,27 @@ def process_video_pipeline(
                     fps=30
                 )
             else:
-                notify(f"Unit {unit_num}/{total_units}: Sketching Vector Line Art ({duration:.1f}s)...")
-                wb_prompt = unit.get("prompt") or f"clean black and white line art vector sketch of {unit.get('query')}, pure white background, coloring book style"
+                wb_prompt = unit.get("prompt") or f"intricate detailed stick figure doodle illustration of {unit.get('query')}, clean black ink outlines, pure white background"
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_wb_image.jpg")
 
+                img_status = "Cached ✅"
                 if not is_valid_media_file(raw_img_path, 5000):
-                    acquired = False
-                    if effective_cookie:
-                        try:
-                            run_sync_generate(wb_prompt, raw_img_path, cookie_u=effective_cookie)
-                            acquired = is_valid_media_file(raw_img_path)
-                        except Exception as e:
-                            logger.warning(f"Bing AI failed ({e}). Falling back...")
+                    _, img_status = acquire_scene_image(
+                        {"prompt": wb_prompt, "query": unit.get("query", ""), "source": unit.get("source") or "bing"},
+                        raw_img_path,
+                        cookies_pool,
+                        force_bing=True,
+                        status_cb=lambda m: notify(f"Unit {unit_num}/{total_units}: {m}")
+                    )
 
-                    if not acquired:
-                        try:
-                            fetch_image(unit.get("query") or wb_prompt, raw_img_path)
-                        except Exception:
-                            generate_emergency_fallback_image(raw_img_path)
+                if os.path.exists(f"{raw_img_path}.fallback"):
+                    with open(fallback_flag, "w") as f:
+                        f.write("1")
 
-                if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Image")
+                if artifact_callback and os.path.exists(raw_img_path):
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Image [{img_status}]")
 
+                notify(f"Unit {unit_num}/{total_units}: Sketching Vector Line Art ({duration:.1f}s)...")
                 generate_native_whiteboard_animation(
                     img_path=raw_img_path,
                     output_path=raw_wb_silent,
@@ -484,52 +617,6 @@ def process_video_pipeline(
                 audio_path=audio_path,
                 output_path=rendered_scene_mp4,
                 animation_video_path=raw_wb_silent
-            )
-
-        # =============================================================
-        # NEWSPAPER MODE: Symmetrical Drop, Highlights & Synced SFX
-        # =============================================================
-        elif pipeline_mode == "newspaper":
-            edition_choice = str(unit.get("newspaper") or newspaper_opts.get("edition") or "alternating").lower()
-            if edition_choice == "alternating":
-                paper_id = "manorama" if (idx % 2 == 0) else "mathrubhumi"
-            elif "mathru" in edition_choice:
-                paper_id = "mathrubhumi"
-            else:
-                paper_id = "manorama"
-
-            enable_sfx = bool(newspaper_opts.get("enable_sfx", True))
-            sfx_volume = float(newspaper_opts.get("sfx_volume", 0.45))
-
-            raw_news_silent = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_raw.mp4")
-            sfx_wav = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_news_sfx.wav") if enable_sfx else None
-
-            notify(f"Unit {unit_num}/{total_units}: Rendering {paper_id.title()} Newspaper ({duration:.1f}s)...")
-            generate_newspaper_animation(
-                unit=unit,
-                output_video_path=raw_news_silent,
-                output_sfx_wav_path=sfx_wav,
-                duration_sec=duration,
-                newspaper_id=paper_id,
-                table_path=newspaper_opts.get("table_path"),
-                defaults={
-                    "date_line": newspaper_opts.get("date_line", ""),
-                    "edition_info": newspaper_opts.get("edition_info", ""),
-                },
-                fps=30,
-            )
-
-            if artifact_callback and sfx_wav and os.path.exists(sfx_wav):
-                artifact_callback("audio", sfx_wav, f"🔊 Scene {unit_num} Newspaper SFX")
-
-            render_individual_scene(
-                scene_type="animation",
-                audio_path=audio_path,
-                output_path=rendered_scene_mp4,
-                animation_video_path=raw_news_silent,
-                sfx_audio_path=sfx_wav,
-                sfx_volume=sfx_volume,
-                fallback_duration=duration,
             )
 
         # =============================================================
@@ -555,7 +642,7 @@ def process_video_pipeline(
                     try:
                         fetch_landscape_video(video_search_query, raw_video_path)
                     except Exception as e:
-                        logger.warning(f"Stock video fetch failed ({e}). Using background fallback...")
+                        notify(f"Scene {unit_num}: Stock video failed ({str(e)[:60]}), using BG loop...")
 
                     if not is_valid_video_file(raw_video_path, 20000):
                         fallback_bg = available_bgs[bg_cycle_idx % len(available_bgs)]
@@ -571,11 +658,19 @@ def process_video_pipeline(
             elif scene_mode == 1:
                 notify(f"Scene {unit_num}/{total_units}: Rendering Stamp Card...")
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_image.jpg")
+                img_status = "Cached ✅"
                 if not is_valid_media_file(raw_img_path, 5000):
-                    acquire_scene_image(unit, raw_img_path, effective_cookie)
+                    _, img_status = acquire_scene_image(
+                        unit, raw_img_path, cookies_pool,
+                        status_cb=lambda m: notify(f"Scene {unit_num}/{total_units}: {m}")
+                    )
 
-                if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Card")
+                if os.path.exists(f"{raw_img_path}.fallback"):
+                    with open(fallback_flag, "w") as f:
+                        f.write("1")
+
+                if artifact_callback and os.path.exists(raw_img_path):
+                    artifact_callback("image", raw_img_path, f"🖼️ Scene {unit_num} Card [{img_status}]")
 
                 bg_loop_video = available_bgs[bg_cycle_idx % len(available_bgs)]
                 bg_cycle_idx += 1
@@ -592,14 +687,23 @@ def process_video_pipeline(
             elif scene_mode == 2:
                 notify(f"Scene {unit_num}/{total_units}: Generating Kinetic Animation...")
                 raw_img_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_ai_image.jpg")
+                img_status = "Cached ✅"
                 if not is_valid_media_file(raw_img_path, 5000):
                     if unit.get("equation", "").strip():
                         render_cinematic_equation_card(unit["equation"], raw_img_path, formula_name=unit.get("formula_name", ""))
+                        img_status = "LaTeX Card"
                     else:
-                        acquire_scene_image(unit, raw_img_path, effective_cookie)
+                        _, img_status = acquire_scene_image(
+                            unit, raw_img_path, cookies_pool,
+                            status_cb=lambda m: notify(f"Scene {unit_num}/{total_units}: {m}")
+                        )
 
-                if artifact_callback and is_valid_media_file(raw_img_path):
-                    artifact_callback("image", raw_img_path, f"🎨 Scene {unit_num} Visual")
+                if os.path.exists(f"{raw_img_path}.fallback"):
+                    with open(fallback_flag, "w") as f:
+                        f.write("1")
+
+                if artifact_callback and os.path.exists(raw_img_path):
+                    artifact_callback("image", raw_img_path, f"🎨 Scene {unit_num} Visual [{img_status}]")
 
                 anim_video_path = os.path.join(CHECKPOINT_DIR, f"{unit_prefix}_{s_hash}_animation.mp4")
                 render_animation_by_index(
