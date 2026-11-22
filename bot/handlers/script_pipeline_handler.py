@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 
+from bot.bot_runner import get_telegram_credentials
 from modules.script_parser import process_video_pipeline
 from modules.text_parser import parse_input_script
 
@@ -36,6 +38,52 @@ def get_bing_cookies():
     except Exception:
         pass
     return os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
+
+
+def _bot_api_request(
+    bot_token: str,
+    method: str,
+    data: dict = None,
+    file_field: str = None,
+    file_path: str = None,
+    timeout: int = 180,
+) -> dict:
+    """
+    Sends messages/media via Telegram's official HTTPS Bot API.
+    Bypasses MTProto DC5 media socket stalls completely for files <= 50 MB.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    last_err = None
+
+    for attempt in range(3):
+        try:
+            if file_field and file_path:
+                with open(file_path, "rb") as f:
+                    resp = requests.post(
+                        url,
+                        data=data or {},
+                        files={file_field: (os.path.basename(file_path), f)},
+                        timeout=timeout,
+                    )
+            else:
+                resp = requests.post(url, json=data or {}, timeout=30)
+
+            payload = resp.json()
+            if payload.get("ok"):
+                return payload
+
+            if resp.status_code == 429:
+                retry_after = int(payload.get("parameters", {}).get("retry_after", 5))
+                time.sleep(min(retry_after + 1, 60))
+                continue
+
+            last_err = f"Telegram Bot API {resp.status_code}: {payload.get('description', payload)}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        time.sleep(2)
+
+    raise RuntimeError(last_err or f"Telegram Bot API {method} failed")
 
 
 def upload_for_direct_url(file_path: str) -> tuple[str, str]:
@@ -153,6 +201,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
     chat_id = message.chat.id
     status_msg = await message.reply_text(f"🚀 Initializing [{mode.upper()}] Pipeline...")
 
+    _, _, bot_token = get_telegram_credentials()
     bing_cookies = get_bing_cookies()
     output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
@@ -171,59 +220,91 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
         if not os.path.exists(file_path):
             return
 
-        # For the final combined video, generate & send a direct download URL first
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+        # 1. For the final combined video, ALWAYS generate & send a direct download URL first
         if artifact_type == "final_video":
             try:
-                size_mb = os.path.getsize(file_path) / (1024 * 1024)
                 progress_callback(f"🌐 Generating direct download URL ({size_mb:.1f} MB)...")
                 dl_url, provider = upload_for_direct_url(file_path)
                 final_download_info["url"] = dl_url
                 final_download_info["provider"] = provider
 
-                async def _send_link():
-                    await client.send_message(
-                        chat_id,
-                        f"🏆 **Final Combined Video Ready!**\n"
-                        f"• **File:** `{os.path.basename(file_path)}` (`{size_mb:.1f} MB`)\n"
-                        f"• **Host:** {provider}\n"
-                        f"• **Direct Download URL:** {dl_url}",
-                        disable_web_page_preview=True
-                    )
-
-                link_future = asyncio.run_coroutine_threadsafe(_send_link(), loop)
-                link_future.result(timeout=60)
+                msg_html = (
+                    f"🏆 <b>Final Combined Video Ready!</b>\n"
+                    f"• <b>File:</b> <code>{html.escape(os.path.basename(file_path))}</code> (<code>{size_mb:.1f} MB</code>)\n"
+                    f"• <b>Host:</b> {html.escape(provider)}\n"
+                    f"• <b>Direct Download URL:</b> {html.escape(dl_url)}"
+                )
+                _bot_api_request(
+                    bot_token,
+                    "sendMessage",
+                    data={
+                        "chat_id": chat_id,
+                        "text": msg_html,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                )
             except Exception as link_err:
                 logger.exception(f"Direct URL upload failed: {link_err!r}")
 
-        async def _upload():
-            for attempt in range(3):
-                try:
-                    if artifact_type == "audio":
-                        await client.send_audio(chat_id, audio=file_path, caption=caption)
-                    elif artifact_type == "image":
-                        await client.send_photo(chat_id, photo=file_path, caption=caption)
-                    elif artifact_type in ["video", "final_video"]:
-                        await client.send_video(
-                            chat_id,
-                            video=file_path,
-                            caption=caption,
-                            supports_streaming=True
-                        )
-                    return
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value)
-                except Exception as err:
-                    if attempt == 2:
-                        raise err
-                    await asyncio.sleep(2)
+        # 2. Fast & reliable HTTPS Bot API upload for all files <= 49.5 MB
+        if size_mb <= 49.5:
+            try:
+                if artifact_type == "audio":
+                    _bot_api_request(
+                        bot_token,
+                        "sendAudio",
+                        data={"chat_id": chat_id, "caption": caption},
+                        file_field="audio",
+                        file_path=file_path,
+                        timeout=120,
+                    )
+                elif artifact_type == "image":
+                    _bot_api_request(
+                        bot_token,
+                        "sendPhoto",
+                        data={"chat_id": chat_id, "caption": caption},
+                        file_field="photo",
+                        file_path=file_path,
+                        timeout=120,
+                    )
+                elif artifact_type in ["video", "final_video"]:
+                    _bot_api_request(
+                        bot_token,
+                        "sendVideo",
+                        data={"chat_id": chat_id, "caption": caption, "supports_streaming": "true"},
+                        file_field="video",
+                        file_path=file_path,
+                        timeout=300,
+                    )
+                return
+            except Exception as http_err:
+                logger.warning(f"HTTPS Bot API upload failed for {artifact_type} ({size_mb:.1f} MB): {http_err}")
+                if artifact_type != "final_video":
+                    return  # Don't hang the pipeline on DC5 MTProto for intermediate files
 
-        upload_timeout = 1800 if artifact_type == "final_video" else 300
-        future = asyncio.run_coroutine_threadsafe(_upload(), loop)
+        # 3. MTProto fallback ONLY for files > 49.5 MB (e.g. very large final_video)
+        async def _upload_mtproto():
+            if artifact_type == "audio":
+                await client.send_audio(chat_id, audio=file_path, caption=caption)
+            elif artifact_type == "image":
+                await client.send_photo(chat_id, photo=file_path, caption=caption)
+            elif artifact_type in ["video", "final_video"]:
+                await client.send_video(
+                    chat_id,
+                    video=file_path,
+                    caption=caption,
+                    supports_streaming=True,
+                )
+
+        future = asyncio.run_coroutine_threadsafe(_upload_mtproto(), loop)
         try:
-            future.result(timeout=upload_timeout)
+            future.result(timeout=600 if artifact_type == "final_video" else 90)
         except Exception as e:
             future.cancel()
-            logger.exception(f"Upload failed ({type(e).__name__}) for {artifact_type}: {e!r}")
+            logger.exception(f"MTProto upload failed ({type(e).__name__}) for {artifact_type}: {e!r}")
 
     newspaper_options = {
         "edition": "alternating",
