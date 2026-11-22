@@ -63,6 +63,8 @@ async def _run_bot_async(api_id: int, api_hash: str, bot_token: str):
         api_hash=api_hash,
         bot_token=bot_token,
         in_memory=True,  # Prevent SQLite locks on ephemeral container filesystems
+        max_concurrent_transmissions=1,  # Prevent DC5 media socket congestion on cloud containers
+        sleep_threshold=60,
         plugins=plugins_config
     )
 
