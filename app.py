@@ -6,6 +6,7 @@ import glob
 import streamlit as st
 
 from bot.bot_runner import start_bot, stop_bot, is_bot_active
+from bot.handlers.script_pipeline_handler import upload_for_direct_url
 from modules.cartesia_tts import VOICE_LIST, DEFAULT_VOICE_NAME
 from modules.script_parser import process_video_pipeline, get_available_backgrounds, BG_DIR, OUTPUT_DIR
 from modules.text_parser import parse_input_script
@@ -35,6 +36,9 @@ os.makedirs(FONTS_DIR, exist_ok=True)
 if "_saved_uploads" not in st.session_state:
     st.session_state["_saved_uploads"] = set()
 
+if "_direct_urls" not in st.session_state:
+    st.session_state["_direct_urls"] = {}
+
 
 def _save_uploaded_once(uploaded_file, dest_path: str) -> bool:
     sig = (dest_path, uploaded_file.name, uploaded_file.size)
@@ -45,6 +49,15 @@ def _save_uploaded_once(uploaded_file, dest_path: str) -> bool:
         f.write(uploaded_file.getbuffer())
     st.session_state["_saved_uploads"].add(sig)
     return True
+
+
+def _get_or_create_direct_url(file_path: str) -> tuple[str, str]:
+    file_sig = (os.path.abspath(file_path), os.path.getsize(file_path))
+    if file_sig in st.session_state["_direct_urls"]:
+        return st.session_state["_direct_urls"][file_sig]
+    dl_url, provider = upload_for_direct_url(file_path)
+    st.session_state["_direct_urls"][file_sig] = (dl_url, provider)
+    return dl_url, provider
 
 
 @st.cache_resource(show_spinner=False)
@@ -296,6 +309,13 @@ with tabs[0]:
                         st.write("• **Resolution:** `1920x1080` (30 FPS)")
                         st.write(f"• **Voice Profile:** `{selected_voice}`")
 
+                        try:
+                            with st.spinner("Generating direct download URL..."):
+                                dl_url, provider = _get_or_create_direct_url(output_file)
+                            st.success(f"🔗 **Direct Download ({provider}):**\n{dl_url}")
+                        except Exception as dl_err:
+                            st.warning(f"Could not generate external direct URL: {dl_err}")
+
                         with open(output_file, "rb") as vf:
                             st.download_button(
                                 label="⬇️ Download Video (MP4)",
@@ -308,6 +328,45 @@ with tabs[0]:
 
             except Exception as e:
                 status_box.error(f"❌ Execution Failure: {e}")
+
+    st.divider()
+    with st.expander("📁 Rendered Outputs in `outputs/` (Direct URL & Recovery)", expanded=False):
+        rendered_files = sorted(
+            glob.glob(os.path.join(OUTPUT_DIR, "*.mp4")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        if not rendered_files:
+            st.caption("No rendered MP4 files found in `outputs/` yet.")
+        else:
+            for r_path in rendered_files:
+                r_name = os.path.basename(r_path)
+                r_mb = os.path.getsize(r_path) / (1024 * 1024)
+                c1, c2, c3 = st.columns([3, 1.5, 1.5])
+                with c1:
+                    st.write(f"🎬 `{r_name}` (`{r_mb:.2f} MB`)")
+                    sig = (os.path.abspath(r_path), os.path.getsize(r_path))
+                    if sig in st.session_state["_direct_urls"]:
+                        u, p = st.session_state["_direct_urls"][sig]
+                        st.caption(f"🔗 **{p}:** {u}")
+                with c2:
+                    if st.button("🔗 Get Direct URL", key=f"url_{r_name}", use_container_width=True):
+                        with st.spinner(f"Uploading {r_name}..."):
+                            try:
+                                u, p = _get_or_create_direct_url(r_path)
+                                st.rerun()
+                            except Exception as err:
+                                st.error(f"Upload failed: {err}")
+                with c3:
+                    with open(r_path, "rb") as rf:
+                        st.download_button(
+                            label="⬇️ Download",
+                            data=rf,
+                            file_name=r_name,
+                            mime="video/mp4",
+                            key=f"dl_{r_name}",
+                            use_container_width=True
+                        )
 
 
 with tabs[1]:
