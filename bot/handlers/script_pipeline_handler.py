@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
 import time
+import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
@@ -35,10 +38,90 @@ def get_bing_cookies():
     return os.getenv("BING_COOKIES") or os.getenv("BING_COOKIE_U") or ""
 
 
+def upload_for_direct_url(file_path: str) -> tuple[str, str]:
+    """
+    Uploads the final video and returns (download_url, provider_label).
+    Streams via curl when available to keep memory usage minimal.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    curl_bin = shutil.which("curl")
+    errors = []
+
+    # 1. Primary: Litterbox (Direct .mp4 URL, up to 1 GB, 72h retention)
+    if size_mb <= 950:
+        lb_url = "https://litterbox.catbox.moe/resources/internals/api.php"
+        try:
+            if curl_bin:
+                res = subprocess.run(
+                    [
+                        curl_bin, "-sS", "--fail", "--max-time", "600",
+                        "-F", "reqtype=fileupload",
+                        "-F", "time=72h",
+                        "-F", f"fileToUpload=@{file_path}",
+                        lb_url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=620,
+                )
+                link = res.stdout.strip()
+                if res.returncode == 0 and link.startswith("https://"):
+                    return link, "Litterbox (Direct MP4, 72h)"
+                errors.append(f"Litterbox curl: {res.stderr.strip() or link}")
+            else:
+                with open(file_path, "rb") as f:
+                    resp = requests.post(
+                        lb_url,
+                        data={"reqtype": "fileupload", "time": "72h"},
+                        files={"fileToUpload": f},
+                        timeout=600,
+                    )
+                link = resp.text.strip()
+                if resp.status_code == 200 and link.startswith("https://"):
+                    return link, "Litterbox (Direct MP4, 72h)"
+                errors.append(f"Litterbox HTTP {resp.status_code}: {link[:120]}")
+        except Exception as e:
+            errors.append(f"Litterbox error: {e}")
+
+    # 2. Fallback: Gofile (Unlimited size, no auth required)
+    gf_url = "https://upload.gofile.io/uploadfile"
+    try:
+        if curl_bin:
+            res = subprocess.run(
+                [
+                    curl_bin, "-sS", "--fail", "--max-time", "600",
+                    "-F", f"file=@{file_path}",
+                    gf_url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=620,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                payload = json.loads(res.stdout)
+                if payload.get("status") == "ok":
+                    return payload["data"]["downloadPage"], "Gofile"
+            errors.append(f"Gofile curl: {res.stderr.strip() or res.stdout[:120]}")
+        else:
+            with open(file_path, "rb") as f:
+                resp = requests.post(gf_url, files={"file": f}, timeout=600)
+            payload = resp.json()
+            if payload.get("status") == "ok":
+                return payload["data"]["downloadPage"], "Gofile"
+            errors.append(f"Gofile error: {payload}")
+    except Exception as e:
+        errors.append(f"Gofile error: {e}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
 async def safe_edit_message(message: Message, text: str):
     for attempt in range(3):
         try:
-            await message.edit_text(text)
+            await message.edit_text(text, disable_web_page_preview=True)
             return
         except FloodWait as e:
             await asyncio.sleep(e.value)
@@ -76,6 +159,7 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
     final_output_video = os.path.join(output_dir, f"video_{mode}_{int(time.time())}.mp4")
 
     loop = asyncio.get_running_loop()
+    final_download_info = {"url": None, "provider": None}
 
     def progress_callback(status_text: str):
         asyncio.run_coroutine_threadsafe(
@@ -86,6 +170,30 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
     def artifact_callback(artifact_type: str, file_path: str, caption: str):
         if not os.path.exists(file_path):
             return
+
+        # For the final combined video, generate & send a direct download URL first
+        if artifact_type == "final_video":
+            try:
+                size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                progress_callback(f"🌐 Generating direct download URL ({size_mb:.1f} MB)...")
+                dl_url, provider = upload_for_direct_url(file_path)
+                final_download_info["url"] = dl_url
+                final_download_info["provider"] = provider
+
+                async def _send_link():
+                    await client.send_message(
+                        chat_id,
+                        f"🏆 **Final Combined Video Ready!**\n"
+                        f"• **File:** `{os.path.basename(file_path)}` (`{size_mb:.1f} MB`)\n"
+                        f"• **Host:** {provider}\n"
+                        f"• **Direct Download URL:** {dl_url}",
+                        disable_web_page_preview=True
+                    )
+
+                link_future = asyncio.run_coroutine_threadsafe(_send_link(), loop)
+                link_future.result(timeout=60)
+            except Exception as link_err:
+                logger.exception(f"Direct URL upload failed: {link_err!r}")
 
         async def _upload():
             for attempt in range(3):
@@ -109,11 +217,13 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
                         raise err
                     await asyncio.sleep(2)
 
+        upload_timeout = 1800 if artifact_type == "final_video" else 300
         future = asyncio.run_coroutine_threadsafe(_upload(), loop)
         try:
-            future.result(timeout=300)
+            future.result(timeout=upload_timeout)
         except Exception as e:
-            logger.error(f"Upload failed: {e}")
+            future.cancel()
+            logger.exception(f"Upload failed ({type(e).__name__}) for {artifact_type}: {e!r}")
 
     newspaper_options = {
         "edition": "alternating",
@@ -140,6 +250,8 @@ async def execute_pipeline_for_user(client: Client, message: Message, script_dat
             f"• Scenes: {len(script_data)}\n"
             f"• Resolution: 1920x1080 (30 FPS)"
         )
+        if final_download_info["url"]:
+            completion_text += f"\n• **Direct Download:** {final_download_info['url']}"
         await safe_edit_message(status_msg, completion_text)
 
     except Exception as e:
