@@ -3,10 +3,11 @@ import json
 import os
 import shutil
 import glob
+import subprocess
+import requests
 import streamlit as st
 
 from bot.bot_runner import start_bot, stop_bot, is_bot_active
-from bot.handlers.script_pipeline_handler import upload_for_direct_url
 from modules.cartesia_tts import VOICE_LIST, DEFAULT_VOICE_NAME
 from modules.script_parser import process_video_pipeline, get_available_backgrounds, BG_DIR, OUTPUT_DIR
 from modules.text_parser import parse_input_script
@@ -51,11 +52,85 @@ def _save_uploaded_once(uploaded_file, dest_path: str) -> bool:
     return True
 
 
+def _upload_for_direct_url(file_path: str) -> tuple[str, str]:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    curl_bin = shutil.which("curl")
+    errors = []
+
+    if size_mb <= 950:
+        lb_url = "https://litterbox.catbox.moe/resources/internals/api.php"
+        try:
+            if curl_bin:
+                res = subprocess.run(
+                    [
+                        curl_bin, "-sS", "--fail", "--max-time", "600",
+                        "-F", "reqtype=fileupload",
+                        "-F", "time=72h",
+                        "-F", f"fileToUpload=@{file_path}",
+                        lb_url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=620,
+                )
+                link = res.stdout.strip()
+                if res.returncode == 0 and link.startswith("https://"):
+                    return link, "Litterbox (Direct MP4, 72h)"
+                errors.append(f"Litterbox curl: {res.stderr.strip() or link}")
+            else:
+                with open(file_path, "rb") as f:
+                    resp = requests.post(
+                        lb_url,
+                        data={"reqtype": "fileupload", "time": "72h"},
+                        files={"fileToUpload": f},
+                        timeout=600,
+                    )
+                link = resp.text.strip()
+                if resp.status_code == 200 and link.startswith("https://"):
+                    return link, "Litterbox (Direct MP4, 72h)"
+                errors.append(f"Litterbox HTTP {resp.status_code}: {link[:120]}")
+        except Exception as e:
+            errors.append(f"Litterbox error: {e}")
+
+    gf_url = "https://upload.gofile.io/uploadfile"
+    try:
+        if curl_bin:
+            res = subprocess.run(
+                [
+                    curl_bin, "-sS", "--fail", "--max-time", "600",
+                    "-F", f"file=@{file_path}",
+                    gf_url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=620,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                payload = json.loads(res.stdout)
+                if payload.get("status") == "ok":
+                    return payload["data"]["downloadPage"], "Gofile"
+            errors.append(f"Gofile curl: {res.stderr.strip() or res.stdout[:120]}")
+        else:
+            with open(file_path, "rb") as f:
+                resp = requests.post(gf_url, files={"file": f}, timeout=600)
+            payload = resp.json()
+            if payload.get("status") == "ok":
+                return payload["data"]["downloadPage"], "Gofile"
+            errors.append(f"Gofile error: {payload}")
+    except Exception as e:
+        errors.append(f"Gofile error: {e}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
 def _get_or_create_direct_url(file_path: str) -> tuple[str, str]:
     file_sig = (os.path.abspath(file_path), os.path.getsize(file_path))
     if file_sig in st.session_state["_direct_urls"]:
         return st.session_state["_direct_urls"][file_sig]
-    dl_url, provider = upload_for_direct_url(file_path)
+    dl_url, provider = _upload_for_direct_url(file_path)
     st.session_state["_direct_urls"][file_sig] = (dl_url, provider)
     return dl_url, provider
 
